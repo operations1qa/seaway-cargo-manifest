@@ -1,0 +1,62 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. Global Safety Net (Default Deny Catch-all)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Global Security Helper Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(resourceData) {
+      return isSignedIn() && resourceData.ownerId == request.auth.uid;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // 3. Validation Rules Helpers
+    function isValidShipment(data) {
+      return data.id is number
+        && data.awb is string && data.awb.size() <= 64
+        && data.flight is string && data.flight.size() <= 32
+        && data.date is string && data.date.size() <= 16
+        && (data.workspaceId == null || data.workspaceId is string);
+    }
+
+    function isValidSchedule(data) {
+      return data.flightCode is string && data.flightCode.size() <= 32
+        && (data.workspaceId == null || data.workspaceId is string);
+    }
+
+    function isValidLoadsheet(data) {
+      return data.shipmentId is number
+        && (data.workspaceId == null || data.workspaceId is string);
+    }
+
+    // 4. Shipments collection constraints
+    match /shipments/{shipmentId} {
+      allow read, write: if true;
+    }
+
+    // 5. Schedules collection constraints
+    match /schedules/{flightCode} {
+      allow read, write: if true;
+    }
+
+    // 6. Loadsheets collection constraints
+    match /loadsheets/{shipmentId} {
+      allow read, write: if true;
+    }
+
+    // 7. In-App Corporate/Work Email Passcode Ledger
+    match /work_users/{email} {
+      allow read, write: if true;
+    }
+  }
+}

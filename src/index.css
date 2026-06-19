@@ -1,0 +1,32 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+/* Scrollbars customized following High Density style */
+::-webkit-scrollbar {
+  width: 16px;
+  height: 16px;
+}
+::-webkit-scrollbar-track {
+  background: #121214;
+  border: 1px solid #27272a;
+}
+::-webkit-scrollbar-thumb {
+  background: #3b82f6;
+  border: 3px solid #121214;
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #60a5fa;
+}
+
+body {
+  font-family: "Inter", sans-serif;
+  background-color: #1e1e1e;
+  color: #cccccc;
+  -webkit-font-smoothing: antialiased;
+}

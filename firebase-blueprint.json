@@ -1,0 +1,99 @@
+{
+  "entities": {
+    "Shipment": {
+      "title": "Shipment",
+      "description": "A single cargo shipment record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer", "description": "Unique numeric ID of the shipment" },
+        "cutoff": { "type": "string", "description": "Cutoff time" },
+        "date": { "type": "string", "description": "Format: DDMMYYYY" },
+        "shipper": { "type": "string", "description": "Shipper name" },
+        "awb": { "type": "string", "description": "Air Waybill number" },
+        "flight": { "type": "string", "description": "Flight number" },
+        "cto": { "type": "string", "description": "Cargo Terminal Operator" },
+        "uld": { "type": "string", "description": "Unit Load Device" },
+        "ice": { "type": "string", "description": "Dry ice requirement details" },
+        "dest": { "type": "string", "description": "Destination airport code" },
+        "commodity": { "type": "string", "description": "Commodity description" },
+        "unitNum": { "type": "string", "description": "Unit number" },
+        "specialInst": { "type": "string", "description": "Special instructions" },
+        "scr": { "type": "string", "description": "SCR status (YES/NO/empty)" },
+        "operator": { "type": "string", "description": "Operator name" },
+        "loadType": { "type": "string", "description": "UNIT or LOOSE" },
+        "jobRef": { "type": "string", "description": "Job reference" },
+        "consolRef": { "type": "string", "description": "Consolidation reference" },
+        "eta": { "type": "string", "description": "Estimated Arrival Time" },
+        "etd": { "type": "string", "description": "Estimated Departure Time" },
+        "complete": { "type": "boolean", "description": "Whether the shipment is complete" },
+        "ownerId": { "type": "string", "description": "User ID of the record owner" },
+        "updatedAt": { "type": "string", "format": "date", "description": "Last updated timestamp" }
+      },
+      "required": ["id", "awb", "flight", "date", "ownerId"]
+    },
+    "FlightScheduleEntry": {
+      "title": "FlightScheduleEntry",
+      "description": "Details about a scheduled flight",
+      "type": "object",
+      "properties": {
+        "flightCode": { "type": "string", "description": "Unique flight code e.g. EK406" },
+        "cutoff": { "type": "string", "description": "Standard cutoff offset or time" },
+        "dest": { "type": "string", "description": "Default destination" },
+        "cto": { "type": "string", "description": "Default Cargo Terminal Operator" },
+        "etd": { "type": "string", "description": "Default estimated departure time" },
+        "eta": { "type": "string", "description": "Default estimated arrival time" },
+        "ownerId": { "type": "string", "description": "User ID of the customizer" },
+        "updatedAt": { "type": "string", "format": "date", "description": "Last updated timestamp" }
+      },
+      "required": ["flightCode", "ownerId"]
+    },
+    "Loadsheet": {
+      "title": "Loadsheet",
+      "description": "Custom load out sheet form variables and attachments",
+      "type": "object",
+      "properties": {
+        "shipmentId": { "type": "integer", "description": "Associated shipment numeric ID" },
+        "parentUld": { "type": "string", "description": "Primary ULD code" },
+        "includeCarcases": { "type": "boolean", "description": "Toggle to include page 2 template" },
+        "ls": { "type": "object", "description": "Raw variables for active page 1 forms" },
+        "ccsMeta": { "type": "object", "description": "Header details for page 2 CCS sheet" },
+        "ccsUnits": { "type": "array", "description": "Structured PMC/ALF units array" },
+        "ownerId": { "type": "string", "description": "User ID who owns this loadsheet" },
+        "updatedBy": { "type": "string", "description": "Auth UID who updated last" },
+        "updatedAt": { "type": "string", "format": "date", "description": "Last saved timestamp" }
+      },
+      "required": ["shipmentId", "ownerId"]
+    },
+    "WorkUser": {
+      "title": "WorkUser",
+      "description": "Pre-authorized coworker/staff account details",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Generated guest UUID for local auth reference" },
+        "displayName": { "type": "string", "description": "Staff coworker display name" },
+        "email": { "type": "string", "description": "Staff coworker corporate email address" },
+        "passcode": { "type": "string", "description": "Passcode credential used to log in" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" }
+      },
+      "required": ["uid", "displayName", "email", "passcode"]
+    }
+  },
+  "firestore": {
+    "shipments/{shipmentId}": {
+      "schema": "Shipment",
+      "description": "Collection of all global shipment manifests"
+    },
+    "schedules/{flightCode}": {
+      "schema": "FlightScheduleEntry",
+      "description": "Customized flight cutoff / schedule settings"
+    },
+    "loadsheets/{shipmentId}": {
+      "schema": "Loadsheet",
+      "description": "Durable and shared Page 1 and Page 2 loadsheet form savings"
+    },
+    "work_users/{email}": {
+      "schema": "WorkUser",
+      "description": "Ledger of pre-authorized staff email credentials and passcodes"
+    }
+  }
+}

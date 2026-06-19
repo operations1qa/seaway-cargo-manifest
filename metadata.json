@@ -1,0 +1,8 @@
+{
+  "name": "Seaway Cargo Loadsheet Manifest",
+  "description": "Premium shipping load manifest manager, cold-chain flight scheduler, and airport cargo checklist tool with an integrated Aviation Hub featuring live CHAMP Track & Trace (AWB) and Unit Load Device (ULD) handling statuses.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
