@@ -5,12 +5,17 @@
 
 export interface FlightInfo {
   cutoff: string;
+  origin?: string;
   dest: string;
   cto: string;
   etd: string;
   eta: string;
   airline?: string;
   days?: string;
+  emailContacts?: string;
+  contactPhone?: string;
+  bookingPortal?: string;
+  bookingNotes?: string;
 }
 
 export interface FlightSchedule {
@@ -39,7 +44,11 @@ export interface Shipment {
   eta: string;
   etd: string;
   complete: boolean;
+  isDeleted?: boolean;
+  confirmDelete?: boolean;
+  deleteSured?: boolean;
   secondFlight?: string;
   ownerId?: string;
   workspaceId?: string;
+  station?: string;
 }

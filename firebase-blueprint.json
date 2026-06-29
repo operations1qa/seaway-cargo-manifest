@@ -76,6 +76,20 @@
         "createdAt": { "type": "string", "description": "Creation timestamp" }
       },
       "required": ["uid", "displayName", "email", "passcode"]
+    },
+    "CargoTemplate": {
+      "title": "CargoTemplate",
+      "description": "Pre-defined loading instructions template for a port",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique key or Firestore ID" },
+        "name": { "type": "string", "description": "Template label/name" },
+        "text": { "type": "string", "description": "Template description/instructions" },
+        "port": { "type": "string", "description": "Station code e.g. MEL, SYD etc." },
+        "ownerId": { "type": "string", "description": "User ID of the creator" },
+        "updatedAt": { "type": "string", "format": "date", "description": "Last saved timestamp" }
+      },
+      "required": ["id", "name", "text", "port"]
     }
   },
   "firestore": {
@@ -94,6 +108,10 @@
     "work_users/{email}": {
       "schema": "WorkUser",
       "description": "Ledger of pre-authorized staff email credentials and passcodes"
+    },
+    "cargo_templates/{templateId}": {
+      "schema": "CargoTemplate",
+      "description": "Pre-defined loading instructions templates per port"
     }
   }
 }

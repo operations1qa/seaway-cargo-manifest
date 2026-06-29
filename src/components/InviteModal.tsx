@@ -13,6 +13,7 @@ interface InviteModalProps {
     displayName: string;
     email: string;
     passcode: string;
+    station?: string;
   } | null;
   workspaceId?: string;
   workspaceName?: string;
@@ -25,16 +26,10 @@ export function InviteModal({ isOpen, onClose, user, workspaceId, workspaceName 
 
   if (!isOpen || !user) return null;
 
-  // Dynamically obtain the current live URL to ensure people connect to the exact same site
-  const rawUrl = typeof window !== "undefined" ? window.location.origin : "https://scheduler-app.com";
-  
-  // Use the working live link directly as requested by the user
-  let cleanUrl = rawUrl;
-  
-  // Construct dynamic join link including workspace code & name
-  const appUrl = workspaceId
-    ? `${cleanUrl}?workspaceId=${encodeURIComponent(workspaceId)}&workspaceName=${encodeURIComponent(workspaceName || "")}`
-    : cleanUrl;
+  const appUrl = "https://seaway-cargo-manifest.vercel.app/";
+
+  const stationInfo = user.station ? `\n- Workstation Address IATA: ${user.station}` : "";
+  const stationInfoSlack = user.station ? `\n📍 *Workstation IATA:* \`${user.station}\`` : "";
 
   // Formatted templates
   const emailSubject = `[ACTION REQUIRED] Onboarding: Corporate Cargo Scheduler Credentials`;
@@ -43,30 +38,42 @@ export function InviteModal({ isOpen, onClose, user, workspaceId, workspaceName 
 
 You have been granted official access to our Cargo Scheduler Ledger. Please follow the instructions below to access the workspace and collaborate on cargo planning/flights:
 
-1. App Workspace Link:
+1. App Workspace Live Link:
 ${appUrl}
 
 2. Login Credentials:
-- Corporate Email: ${user.email}
-- Secure Passcode: ${user.passcode}
+- Corporate Email Address: ${user.email}
+- Secure Password/Passcode: ${user.passcode}${stationInfo}
 
 Instructions:
-Click the workspace link above, select the "Work Email / Passcode" option, enter your credentials as listed, and click "Authorize Station Access" (or "Register Station Account") to log in. You will instantly synchronize with the team's cargo manifests, load sheets, and flight schedules.
+Click the workspace link above, select the "Work Email / Passcode" or "Direct sign in" option, enter your credentials as listed, and click "Authorize Station Access" to log in. You will instantly synchronize with the live sheet, cargo manifests, load sheets, and flight schedules.
 
 Best regards,
 Operations Management Team`;
 
   const chatBody = `*Cargo Scheduler Access Granted* ✈️
 Dear *${user.displayName}*, you are authorized!
-🔗 *App Link:*  ${appUrl}
-✉️ *Work Email:* \`${user.email}\`
-🔑 *Passcode:* \`${user.passcode}\`
+🔗 *App Live Link:* ${appUrl}
+✉️ *Work Email Address:* \`${user.email}\`
+🔑 *Passcode:* \`${user.passcode}\`${stationInfoSlack}
 _To join: open the link, click "Work Email / Passcode", and log in with your credentials._`;
 
   // Standard handler to copy content to clipboard using the modern clipboard API
   const handleCopyText = async (text: string, type: "email" | "chat") => {
     try {
-      await navigator.clipboard.writeText(text);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textArea = document.createElement("textarea");
+        textArea.value = text;
+        textArea.style.position = "fixed";
+        textArea.style.left = "-9999px";
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textArea);
+      }
       if (type === "email") {
         setCopiedEmail(true);
         setTimeout(() => setCopiedEmail(false), 2000);
@@ -181,23 +188,7 @@ _To join: open the link, click "Work Email / Passcode", and log in with your cre
             </p>
           </div>
 
-          {typeof window !== "undefined" && window.location.origin.includes("ais-dev-") && (
-            <div
-              style={{
-                background: "#f0fdf4",
-                border: "1px solid #bbf7d0",
-                borderRadius: "10px",
-                padding: "10px 12px",
-                fontSize: "11px",
-                color: "#166534",
-                marginBottom: "16px",
-                lineHeight: "1.4",
-              }}
-            >
-              <strong style={{ display: "block", marginBottom: "4px" }}>✅ Live Collaboration Workspace Active</strong>
-              The collaboration system is now updated to use your active working workspace URL (<code>ais-dev-...</code>). Send this link to your team so they can quickly collaborate and synchronize with your system live!
-            </div>
-          )}
+
 
           {/* Credentials Summary */}
           <div
@@ -213,7 +204,7 @@ _To join: open the link, click "Work Email / Passcode", and log in with your cre
             <span style={{ fontSize: "10.5px", fontWeight: 800, color: "#64748b", textTransform: "uppercase", display: "block", marginBottom: "8px" }}>
               Teammate Access Profile
             </span>
-            <div style={{ display: "grid", gridTemplateColumns: "100px 1fr", gap: "6px 12px", alignItems: "center" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "6px 12px", alignItems: "center" }}>
               <span style={{ color: "#64748b", fontWeight: 500 }}>Name:</span>
               <strong style={{ color: "#0f172a" }}>{user.displayName}</strong>
 
@@ -222,6 +213,13 @@ _To join: open the link, click "Work Email / Passcode", and log in with your cre
 
               <span style={{ color: "#64748b", fontWeight: 500 }}>Secured Passcode:</span>
               <span style={{ color: "#0284c7", fontWeight: 700, fontFamily: "monospace" }}>🔑 {user.passcode}</span>
+
+              {user.station && (
+                <>
+                  <span style={{ color: "#64748b", fontWeight: 500 }}>IATA:</span>
+                  <span style={{ color: "#0ea5e9", fontWeight: 700, fontSize: "11px" }}>📍 {user.station}</span>
+                </>
+              )}
             </div>
           </div>
 

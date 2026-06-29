@@ -8,14 +8,17 @@ import { Plus, Trash2, Edit, ArrowLeft, Save } from "lucide-react";
 import { Shipment } from "../types";
 import { T } from "../utils/theme";
 import { toDisplay, todayStr, getDayOfWeek, formatAwb } from "../utils/helpers";
-import { doc, getDoc, setDoc, deleteDoc } from "firebase/firestore";
-import { auth, db } from "../lib/firebase";
+import { doc, getDoc, setDoc, deleteDoc, collection, onSnapshot, query, where } from "firebase/firestore";
+import { auth, db, OperationType, handleFirestoreError } from "../lib/firebase";
 
 interface LoadsheetModalProps {
   row: Shipment;
   onClose: () => void;
   currentUser?: { uid: string; displayName: string; email: string } | null;
   offlineMode?: boolean;
+  onUpdateShipment?: (id: number, fields: Partial<Shipment>) => void;
+  isAdmin?: boolean;
+  activePort?: string;
 }
 
 interface CargoRow {
@@ -28,50 +31,12 @@ interface CargoRow {
   checked: boolean;
 }
 
-const DEFAULT_INSTRUCTION_TEMPLATES = [
-  {
-    id: "cold-1",
-    name: "🌡️ Cold Chain (Pharma 2-8°C)",
-    text: "COLD CHAIN PROTOCOL: MONITOR REEFER TEMP THROUGHOUT OPERATION. MAINTAIN TEMP +2C TO +8C. IMMEDIATELY REPORT EXCURSIONS TO OVERSEER."
-  },
-  {
-    id: "cold-2",
-    name: "❄️ Cold Chain (Freezer -20°C)",
-    text: "FREEZER CARGO PROTOCOL: MAINTAIN DECK STORAGE BELOW -20C. EXTREME TEMPERATURE CRITICAL CARGO. DO NOT LEAVE IN SUNLIGHT."
-  },
-  {
-    id: "dry-ice",
-    name: "🧊 Dry Ice Handling Safety",
-    text: "DRY ICE CARGO SECURE SPEC: CHECK VENTILATION COVERS. DRY ICE TOTAL SPEC WEIGHT COMPLIANT WITH CARRIER REGULATION."
-  },
-  {
-    id: "priority",
-    name: "💎 Priority / High Value Cargo",
-    text: "HIGH VALUE VAL CARGO: STORE IN SECURE DEPOT UNTIL DISPATCH. COMPULSORY HANDOVER RECORD UNDER CARRIER ESCORT."
-  },
-  {
-    id: "fragile",
-    name: "📦 Fragile / Heavy Stack Limit",
-    text: "FRAGILE CARGO STACK LIMIT: NO DOUBLE-STACKING AUTHORIZED. POSITION ON FLAT SURFACE ONLY. LASH SECURELY TO PORT SIDES."
-  },
-  {
-    id: "avi",
-    name: "🐾 Live Animals ventilations (AVI)",
-    text: "LIVE ANIMALS IN AVI COMPARTMENT ONLY: VERIFY VENTILATION FANS ENGAGED. DO NOT CO-LOAD DRY ICE OR TOXIC SUBSTANCES NEXT TO THESIS STATIONS."
-  },
-  {
-    id: "dg9",
-    name: "⚠️ Dangerous Goods (DG Class 9)",
-    text: "CLASS 9 DANGEROUS GOODS CONFORMS TO IATA SPEC. STOW ACCORDING TO HAZCHEM INDEX. VERIFY DECK COMPARTMENT FIRE SUPPRESSION COMPATIBLE."
-  }
-];
-
-export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, currentUser, offlineMode }) => {
+export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, currentUser, offlineMode, onUpdateShipment, isAdmin = false, activePort = "MEL" }) => {
   const printRef = useRef<HTMLDivElement>(null);
 
-  // Pre-fill exactly 12 blank cargo rows, leaving all fields blank on creation
+  // Pre-fill exactly 11 blank cargo rows, leaving all fields blank on creation
   const getInitialCargoRows = (): CargoRow[] => {
-    return Array(12).fill(null).map(() => ({
+    return Array(11).fill(null).map(() => ({
       grn: "", skd: "", count: "", desc: "", weight: "", picked: false, checked: false
     }));
   };
@@ -94,6 +59,14 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
       if (savedParentUld !== parentUld) {
         loadedLs.uld = parentUld;
         loadedLs.unitsLine2 = parentUld;
+      }
+      // Ensure there are at least 11 cargo rows
+      if (loadedLs.cargoRows && loadedLs.cargoRows.length < 11) {
+        const diff = 11 - loadedLs.cargoRows.length;
+        const extra = Array(diff).fill(null).map(() => ({
+          grn: "", skd: "", count: "", desc: "", weight: "", picked: false, checked: false
+        }));
+        loadedLs.cargoRows = [...loadedLs.cargoRows, ...extra];
       }
       return loadedLs;
     }
@@ -148,27 +121,113 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
   const [templateMenu, setTemplateMenu] = useState<{ x: number, y: number, visible: boolean } | null>(null);
   const [tmplIdToDelete, setTmplIdToDelete] = useState<string | null>(null);
 
-  const [templates, setTemplates] = useState<{ id: string; name: string; text: string }[]>(() => {
-    const saved = localStorage.getItem("SEAWAY_CARGO_TEMPLATES");
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error("Error loading templates:", e);
-      }
-    }
-    return DEFAULT_INSTRUCTION_TEMPLATES;
-  });
-
+  const [templates, setTemplates] = useState<{ id: string; name: string; text: string; port: string; ownerId?: string }[]>([]);
   const [menuMode, setMenuMode] = useState<"select" | "manage" | "add" | "edit">("select");
   const [editTmplId, setEditTmplId] = useState<string | null>(null);
   const [tempName, setTempName] = useState("");
   const [tempText, setTempText] = useState("");
+  const [tempPort, setTempPort] = useState("");
   const [templateSearch, setTemplateSearch] = useState("");
 
-  const saveTemplatesList = (newTmpls: { id: string; name: string; text: string }[]) => {
-    setTemplates(newTmpls);
-    localStorage.setItem("SEAWAY_CARGO_TEMPLATES", JSON.stringify(newTmpls));
+  useEffect(() => {
+    if (offlineMode) {
+      const saved = localStorage.getItem("SEAWAY_CARGO_TEMPLATES_V3");
+      if (saved) {
+        try {
+          setTemplates(JSON.parse(saved));
+        } catch (e) {
+          console.error("Error parsing templates:", e);
+        }
+      } else {
+        setTemplates([]);
+        localStorage.setItem("SEAWAY_CARGO_TEMPLATES_V3", JSON.stringify([]));
+      }
+      return;
+    }
+
+    const unsub = onSnapshot(collection(db, "cargo_templates"), (snapshot) => {
+      const fetched: any[] = [];
+      snapshot.forEach((snapshotDoc) => {
+        fetched.push({ id: snapshotDoc.id, ...snapshotDoc.data() });
+      });
+      setTemplates(fetched);
+      localStorage.setItem("SEAWAY_CARGO_TEMPLATES_V3", JSON.stringify(fetched));
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, "cargo_templates");
+      const saved = localStorage.getItem("SEAWAY_CARGO_TEMPLATES_V3");
+      if (saved) {
+        try {
+          setTemplates(JSON.parse(saved));
+        } catch (e) {
+          // ignore
+        }
+      }
+    });
+
+    return () => unsub();
+  }, [offlineMode, currentUser]);
+
+  const handleAddNewTemplate = async (name: string, text: string, pVal: string) => {
+    const cleanedPort = (pVal || "").toUpperCase();
+    const newId = `${cleanedPort.toLowerCase()}_${Date.now()}`;
+    const newTmpl = {
+      id: newId,
+      name: name.trim(),
+      text: text.trim(),
+      port: cleanedPort,
+      ownerId: currentUser?.uid || "system",
+      updatedAt: new Date().toISOString()
+    };
+
+    if (offlineMode) {
+      const updated = [...templates, newTmpl];
+      setTemplates(updated);
+      localStorage.setItem("SEAWAY_CARGO_TEMPLATES_V3", JSON.stringify(updated));
+    } else {
+      try {
+        await setDoc(doc(db, "cargo_templates", newId), newTmpl);
+      } catch (err) {
+        console.error("Error adding template to Firestore:", err);
+      }
+    }
+  };
+
+  const handleEditExistingTemplate = async (id: string, name: string, text: string, pVal: string) => {
+    const cleanedPort = (pVal || "").toUpperCase();
+    const updatedTmpl = {
+      id,
+      name: name.trim(),
+      text: text.trim(),
+      port: cleanedPort,
+      ownerId: currentUser?.uid || "system",
+      updatedAt: new Date().toISOString()
+    };
+
+    if (offlineMode) {
+      const updated = templates.map(t => t.id === id ? updatedTmpl : t);
+      setTemplates(updated);
+      localStorage.setItem("SEAWAY_CARGO_TEMPLATES_V3", JSON.stringify(updated));
+    } else {
+      try {
+        await setDoc(doc(db, "cargo_templates", id), updatedTmpl);
+      } catch (err) {
+        console.error("Error updating template in Firestore:", err);
+      }
+    }
+  };
+
+  const handleDeleteExistingTemplate = async (id: string) => {
+    if (offlineMode) {
+      const updated = templates.filter(t => t.id !== id);
+      setTemplates(updated);
+      localStorage.setItem("SEAWAY_CARGO_TEMPLATES_V3", JSON.stringify(updated));
+    } else {
+      try {
+        await deleteDoc(doc(db, "cargo_templates", id));
+      } catch (err) {
+        console.error("Error deleting template from Firestore:", err);
+      }
+    }
   };
 
   // CCS Control Sheet specific state
@@ -315,6 +374,69 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
       return prev;
     });
   }, [ccsMeta.operator, ccsMeta.mawb, ccsMeta.flight, ccsMeta.destination, ccsMeta.shipper]);
+  
+  // Synchronize loadsheet with parent row changes (such as loadType, cutoff, date, flight, dest, shipper, and awb)
+  useEffect(() => {
+    const calculatedDay = row.date ? `${getDayOfWeek(row.date).toUpperCase()} - ${toDisplay(row.date)}` : "";
+    const calculatedCutoffTime = row.cutoff || "";
+    const calculatedCutoffDateTime = `${toDisplay(row.date) || ""} / ${row.cutoff || ""}`;
+
+    setLs(prev => {
+      const updates = {} as Partial<typeof ls>;
+      if (row.operator && prev.operator !== row.operator) updates.operator = row.operator;
+      if (row.awb && prev.mawb !== row.awb) updates.mawb = row.awb;
+      if (calculatedDay && prev.cutoffDay !== calculatedDay) updates.cutoffDay = calculatedDay;
+      if (prev.cutoffTime !== calculatedCutoffTime) updates.cutoffTime = calculatedCutoffTime;
+      if (row.shipper && prev.shipper !== row.shipper) updates.shipper = row.shipper;
+      if (row.flight && prev.flight !== row.flight) updates.flight = row.flight;
+      if (row.dest && prev.destination !== row.dest) updates.destination = row.dest;
+      if (row.commodity && prev.commodity !== row.commodity) updates.commodity = row.commodity;
+      if (row.cto && prev.cto !== row.cto) updates.cto = row.cto;
+      if (row.uld && prev.uld !== row.uld) updates.uld = row.uld;
+      if (row.ice && prev.ice !== row.ice) updates.ice = row.ice;
+      if (row.scr && prev.scr !== row.scr) updates.scr = row.scr;
+
+      if (Object.keys(updates).length > 0) {
+        return { ...prev, ...updates };
+      }
+      return prev;
+    });
+
+    setCcsMeta(prev => {
+      const updates = {} as Partial<typeof ccsMeta>;
+      if (row.operator && prev.operator !== row.operator) updates.operator = row.operator;
+      if (row.awb && prev.mawb !== row.awb) updates.mawb = row.awb;
+      if (row.flight && prev.flight !== row.flight) updates.flight = row.flight;
+      if (prev.cutoffDateTime !== calculatedCutoffDateTime) updates.cutoffDateTime = calculatedCutoffDateTime;
+      if (row.shipper && prev.shipper !== row.shipper) updates.shipper = row.shipper;
+      if (row.dest && prev.destination !== row.dest) updates.destination = row.dest;
+
+      if (Object.keys(updates).length > 0) {
+        return { ...prev, ...updates };
+      }
+      return prev;
+    });
+  }, [
+    row.operator,
+    row.awb,
+    row.date,
+    row.cutoff,
+    row.shipper,
+    row.flight,
+    row.dest,
+    row.commodity,
+    row.cto,
+    row.uld,
+    row.ice,
+    row.scr
+  ]);
+
+  // Keep parent shipment's operator in sync with loadsheet operator in real-time
+  useEffect(() => {
+    if (onUpdateShipment && ls.operator && ls.operator !== row.operator) {
+      onUpdateShipment(row.id, { operator: ls.operator });
+    }
+  }, [ls.operator, row.id, row.operator, onUpdateShipment]);
 
   // Track last seen row.uld to mirror any programmatic ULD change cleanly
   const lastSeenUldRef = useRef(row.uld || "");
@@ -443,7 +565,13 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
     if (k === "mawb") {
       val = formatAwb(val, ls.mawb);
     }
-    setLs((s) => ({ ...s, [k]: val }));
+    setLs((s) => {
+      const updates: Partial<typeof ls> = { [k]: val };
+      if (k === "uld") {
+        updates.unitsLine2 = val;
+      }
+      return { ...s, ...updates };
+    });
   };
 
   const setCargo = (i: number, k: keyof CargoRow, v: string | boolean) => {
@@ -499,13 +627,13 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
   const getSopFontSize = (text: string) => {
     if (!text) return "14px";
     
-    // We want the text to perfectly fit the fixed textarea height of 130px.
-    // Allow the font-size to dynamically scale from a maximum of 16px down to 5.5px.
-    const availableHeight = 112; // 130px container height minus exact padding/borders
+    // We want the text to perfectly fit the expanded fixed textarea height of 190px.
+    // Allow the font-size to dynamically scale from a maximum of 18px down to 6.5px.
+    const availableHeight = 172; // 190px container height minus exact padding/borders
     const containerWidth = 310;  // approximate width of the split column in px
     const lines = text.split("\n");
     
-    for (let fs = 16; fs >= 5.5; fs -= 0.5) {
+    for (let fs = 18; fs >= 6.5; fs -= 0.5) {
       // Bold characters occupy approximately 53% of the font size on average in width.
       const charWidth = fs * 0.53;
       const maxCharsPerLine = Math.floor(containerWidth / charWidth) || 1;
@@ -525,7 +653,39 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
       }
     }
     
-    return "5.5px"; // minimum readable size for ultra-long instruction blocks
+    return "6.5px"; // minimum readable size for ultra-long instruction blocks
+  };
+
+  const getUnitsFontSize = (text: string) => {
+    if (!text) return "16px";
+    
+    // We want the text to perfectly fit the expanded fixed textarea height of 150px.
+    // Allow the font-size to dynamically scale from a maximum of 18px down to 8px.
+    const availableHeight = 132; // 150px container height minus exact padding/borders
+    const containerWidth = 310;  // approximate width of the split column in px
+    const lines = text.split("\n");
+    
+    for (let fs = 18; fs >= 8; fs -= 0.5) {
+      // Bold characters occupy approximately 53% of the font size on average in width.
+      const charWidth = fs * 0.53;
+      const maxCharsPerLine = Math.floor(containerWidth / charWidth) || 1;
+      
+      let totalVisualLines = 0;
+      for (const line of lines) {
+        if (line.length === 0) {
+          totalVisualLines += 1;
+        } else {
+          totalVisualLines += Math.max(1, Math.ceil(line.length / maxCharsPerLine));
+        }
+      }
+      
+      const neededHeight = totalVisualLines * (fs * 1.25); // line-height is 1.25
+      if (neededHeight <= availableHeight) {
+        return `${fs}px`;
+      }
+    }
+    
+    return "8px"; // minimum readable size for lots of unit numbers
   };
 
   const handlePrint = () => {
@@ -541,27 +701,56 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
     if (!printRef.current) return;
 
     // Dynamically transfer all user input states to raw HTML attributes
-    // so standard window.open innerHTML capture prints accurately.
+    // by cloning the container to preserve live browser UI.
     const container = printRef.current;
-    const inputs = container.querySelectorAll("input, textarea");
-    inputs.forEach((input) => {
-      const el = input as HTMLInputElement | HTMLTextAreaElement;
+    const containerClone = container.cloneNode(true) as HTMLDivElement;
+
+    const originalInputs = container.querySelectorAll("input, textarea");
+    const clonedInputs = containerClone.querySelectorAll("input, textarea");
+
+    clonedInputs.forEach((clonedInput, index) => {
+      const origEl = originalInputs[index] as HTMLInputElement | HTMLTextAreaElement;
+      const el = clonedInput as HTMLInputElement | HTMLTextAreaElement;
+
       if (el.type === "checkbox") {
-        const cb = el as HTMLInputElement;
+        const cb = origEl as HTMLInputElement;
         if (cb.checked) {
-          cb.setAttribute("checked", "checked");
+          el.setAttribute("checked", "checked");
         } else {
-          cb.removeAttribute("checked");
+          el.removeAttribute("checked");
         }
       } else {
-        el.setAttribute("value", el.value || "");
+        el.setAttribute("value", origEl.value || "");
       }
+
       if (el.tagName === "TEXTAREA") {
-        el.textContent = el.value || "";
+        // Replace textarea with a div for perfect print wrapping and height expansion
+        const div = document.createElement("div");
+        div.className = el.className;
+        div.textContent = origEl.value || "—";
+        
+        // Copy relevant styles for styling preservation
+        const origStyle = window.getComputedStyle(origEl);
+        div.setAttribute("style", `
+          white-space: pre-wrap;
+          word-break: break-word;
+          font-family: inherit;
+          font-weight: bold;
+          font-size: ${origStyle.fontSize || "11px"};
+          line-height: ${origStyle.lineHeight || "1.25"};
+          border: 2px solid #000000;
+          padding: 6px 8px;
+          min-height: 85px;
+          height: auto;
+          box-sizing: border-box;
+          background: #ffffff;
+          margin-bottom: 4px;
+        `);
+        el.parentNode?.replaceChild(div, el);
       }
     });
 
-    const content = container.innerHTML;
+    const content = containerClone.innerHTML;
     const win = window.open("", "_blank", "width=950,height=800");
     if (!win) return;
 
@@ -723,7 +912,7 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
         } 
         @page {
           size: portrait;
-          margin: 0.3cm 0.3cm !important;
+          margin: 1.2cm !important;
         }
         #loadsheet-print-container {
           padding: 0 !important;
@@ -738,82 +927,90 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
           box-sizing: border-box !important;
           width: 100% !important;
           page-break-inside: avoid !important;
-          page-break-after: avoid !important;
           break-inside: avoid !important;
         }
         #loadsheet-page-1 {
-          transform: scale(0.95) !important;
-          transform-origin: top center !important;
-          margin: 0 auto !important;
-          height: 1060px !important;
-          overflow: hidden !important;
+          height: auto !important;
+          overflow: visible !important;
         }
-        #loadsheet-page-1 > div {
-          margin-bottom: 2px !important;
-        }
-        #loadsheet-page-1 textarea {
-          height: 85px !important;
-        }
-        #loadsheet-page-1 td {
-          padding: 2px 4px !important;
-        }
-        #loadsheet-page-1 th {
-          padding: 3px 4px !important;
-          font-size: 13px !important;
-        }
-        #loadsheet-page-1 [style*="min-height: 44px"],
-        #loadsheet-page-1 [style*="min-height:44px"],
-        #loadsheet-page-1 [style*="minHeight: 44px"],
-        #loadsheet-page-1 [style*="minHeight:44px"],
-        #loadsheet-page-1 [style*="minHeight: 44"],
-        #loadsheet-page-1 [style*="minHeight:44"] {
-          min-height: 30px !important;
-        }
-        #loadsheet-page-1 [style*="min-height: 36px"],
-        #loadsheet-page-1 [style*="min-height:36px"],
-        #loadsheet-page-1 [style*="minHeight: 36px"],
-        #loadsheet-page-1 [style*="minHeight:36px"],
-        #loadsheet-page-1 [style*="minHeight: 36"],
-        #loadsheet-page-1 [style*="minHeight:36"] {
-          min-height: 24px !important;
-        }
-
         #loadsheet-page-2 {
           page-break-before: always !important;
           break-before: page !important;
-          transform: scale(0.95) !important;
-          transform-origin: top center !important;
-          margin: 0 auto !important;
-          height: 1060px !important;
-          overflow: hidden !important;
+          height: auto !important;
+          overflow: visible !important;
           border-top: none !important;
           padding-top: 0 !important;
           margin-top: 0 !important;
         }
-        #loadsheet-page-2 > div {
+        .print-page-inner {
+          transform: none !important;
+          margin: 0 auto !important;
+          height: auto !important;
+          width: 100% !important;
+          overflow: visible !important;
+        }
+        #loadsheet-page-1 .print-page-inner {
+          transform: none !important;
+          max-height: none !important;
+        }
+        #loadsheet-page-2 .print-page-inner {
+          transform: none !important;
+          max-height: none !important;
+        }
+        .print-page-inner > div {
           margin-bottom: 2px !important;
         }
-        #loadsheet-page-2 td {
+        .print-page-inner textarea {
+          height: auto !important;
+        }
+        .print-page-inner td {
           padding: 2px 4px !important;
         }
-        #loadsheet-page-2 th {
-          padding: 3px 4px !important;
+        .print-page-inner td input:not([type="checkbox"]) {
+          padding: 2px 4px !important;
+          font-size: 11px !important;
+          height: auto !important;
+        }
+        .print-page-inner th {
+          padding: 2px 4px !important;
+          font-size: 11px !important;
+        }
+        
+        /* Cargo table special print override to make it 1.5x larger and high contrast */
+        .cargo-table th {
+          padding: 6px 6px !important;
           font-size: 13px !important;
         }
-        #loadsheet-page-2 [style*="min-height: 44px"],
-        #loadsheet-page-2 [style*="min-height:44px"],
-        #loadsheet-page-2 [style*="minHeight: 44px"],
-        #loadsheet-page-2 [style*="minHeight:44px"],
-        #loadsheet-page-2 [style*="minHeight: 44"],
-        #loadsheet-page-2 [style*="minHeight:44"] {
+        .cargo-table td {
+          padding: 0 !important;
+        }
+        .cargo-table td input:not([type="checkbox"]) {
+          padding: 4px 6px !important;
+          font-size: 14px !important;
+          height: auto !important;
+        }
+        .cargo-table input[type="checkbox"] {
+          width: 20px !important;
+          height: 20px !important;
+        }
+        .cargo-table input[type="checkbox"]:checked::after {
+          font-size: 15px !important;
+        }
+
+        .print-page-inner [style*="min-height: 44px"],
+        .print-page-inner [style*="min-height:44px"],
+        .print-page-inner [style*="minHeight: 44px"],
+        .print-page-inner [style*="minHeight:44px"],
+        .print-page-inner [style*="minHeight: 44"],
+        .print-page-inner [style*="minHeight:44"] {
           min-height: 30px !important;
         }
-        #loadsheet-page-2 [style*="min-height: 36px"],
-        #loadsheet-page-2 [style*="min-height:36px"],
-        #loadsheet-page-2 [style*="minHeight: 36px"],
-        #loadsheet-page-2 [style*="minHeight:36px"],
-        #loadsheet-page-2 [style*="minHeight: 36"],
-        #loadsheet-page-2 [style*="minHeight:36"] {
+        .print-page-inner [style*="min-height: 36px"],
+        .print-page-inner [style*="min-height:36px"],
+        .print-page-inner [style*="minHeight: 36px"],
+        .print-page-inner [style*="minHeight:36px"],
+        .print-page-inner [style*="minHeight: 36"],
+        .print-page-inner [style*="minHeight:36"] {
           min-height: 24px !important;
         }
 
@@ -920,7 +1117,7 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
 
         {/* Modal toolbar - Apple style */}
         <div style={{ background: "#f5f5f7", padding: "14px 20px", borderBottom: "1px solid #e5e7eb", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 10 }}>
-          <span style={{ color: T.accent, fontWeight: 700, fontSize: 14 }}>📋 SEAWAY — {ls.shipper || row.shipper}</span>
+          <span style={{ color: T.accent, fontWeight: 700, fontSize: 14 }}>📋 LOADSHEET — {ls.shipper || row.shipper}</span>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
             <button
               id="load-sheet-carcases-toggle"
@@ -990,149 +1187,173 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
           `}</style>
 
           <div id="loadsheet-page-1" className="print-page">
+            <div className="print-page-inner">
           {/* TITLE */}
-          <div style={{ textAlign: "center", fontSize: 22, fontWeight: "900", border: "2px solid #000000", padding: "6px", marginBottom: 4, letterSpacing: 2 }}>SEAWAY</div>
+          <div style={{ textAlign: "center", fontSize: 18, fontWeight: "900", border: "2px solid #000000", padding: "3px", marginBottom: 3, letterSpacing: 2 }}>LOAD SHEET</div>
           
-          {/* LARGE SHIPPER BOX (REPLACED SMALL SEAWAY) */}
-          <div style={{ border: "2px solid #000000", padding: "6px 12px", marginBottom: 6, background: "#ffffff" }}>
-            <span style={lblSt}>SHIPPER</span>
-            <input value={ls.shipper} onChange={sl("shipper")} style={{ border: "none", width: "100%", outline: "none", background: "transparent", fontSize: "18px", fontWeight: "900", color: "#000000", textTransform: "uppercase" }} />
+          {/* SHIPPER & MAWB ROW */}
+          <div style={{ display: "grid", gridTemplateColumns: "1.8fr 1.2fr", marginBottom: 4, border: "2px solid #000000", background: "#ffffff" }}>
+            <div style={{ ...cellSt(36), border: "none", borderRight: "2px solid #000000", padding: "4px 8px" }}>
+              <span style={lblSt}>SHIPPER</span>
+              <input value={ls.shipper} onChange={sl("shipper")} style={{ border: "none", width: "100%", outline: "none", background: "transparent", fontSize: "15px", fontWeight: "900", color: "#000000", textTransform: "uppercase", padding: 0 }} />
+            </div>
+            <div style={{ ...cellSt(36), border: "none", padding: "4px 8px" }}>
+              <span style={lblSt}>MAWB / AWB #</span>
+              <input value={ls.mawb} onChange={sl("mawb")} style={{ border: "none", width: "100%", outline: "none", background: "transparent", fontSize: "15px", fontWeight: "900", color: "#000000", padding: 0 }} />
+            </div>
           </div>
 
-          {/* OPERATOR */}
-          <div style={{ border: "2px solid #000000", display: "grid", gridTemplateColumns: "1fr 3fr", marginBottom: 6, background: "#ffffff" }}>
-            <div style={{ ...cellSt(36), border: "none", borderRight: "2px solid #000000" }}>
+          {/* OPERATOR, COMMODITY, CUT OFF & FLIGHT INFO */}
+          <div style={{ border: "2px solid #000000", display: "grid", gridTemplateColumns: "1fr 2fr 1.2fr 1.1fr 1fr", marginBottom: 4, background: "#ffffff" }}>
+            <div style={{ ...cellSt(30), border: "none", borderRight: "2px solid #000000" }}>
               <span style={lblSt}>OPERATOR {!ls.operator.trim() && <span style={{ color: "#dc2626" }}>*required</span>}</span>
-              <input value={ls.operator} onChange={sl("operator")} style={{ ...fld, fontSize: 13, fontWeight: 700, border: "none", color: ls.operator.trim() ? "#000000" : "#dc2626" }}/>
+              <input value={ls.operator} onChange={sl("operator")} style={{ ...fld, fontSize: 12, fontWeight: 700, border: "none", color: ls.operator.trim() ? "#000000" : "#dc2626" }}/>
             </div>
-            <div style={{ ...cellSt(36), border: "none" }}>
+            <div style={{ ...cellSt(30), border: "none", borderRight: "2px solid #000000" }}>
               <span style={lblSt}>COMMODITY / DESCRIPTION</span>
               <input value={ls.commodity} onChange={sl("commodity")} style={{ ...fld, border: "none", fontWeight: 700 }}/>
             </div>
-          </div>
-
-          {/* FLIGHT SCHED DETAILS */}
-          <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr", marginBottom: 6, border: "2px solid #000000", background: "#ffffff" }}>
-            <div style={{ ...cellSt(36), border: "none", borderRight: "2px solid #000000" }}>
-              <span style={lblSt}>MAWB / AWB #</span>
-              <input value={ls.mawb} onChange={sl("mawb")} style={{ ...fld, fontSize: 14, fontWeight: 700, border: "none" }}/>
-            </div>
-            <div style={{ ...cellSt(36), border: "none", borderRight: "2px solid #000000" }}>
+            <div style={{ ...cellSt(30), border: "none", borderRight: "2px solid #000000" }}>
               <span style={lblSt}>CUT OFF DAY / DATE</span>
               <input value={ls.cutoffDay} onChange={sl("cutoffDay")} style={{ ...fld, fontWeight: 700, border: "none" }}/>
             </div>
-            <div style={{ ...cellSt(36), border: "none", borderRight: "2px solid #000000" }}>
+            <div style={{ ...cellSt(30), border: "none", borderRight: "2px solid #000000" }}>
               <span style={lblSt}>CUT OFF TIME</span>
               <input value={ls.cutoffTime} onChange={sl("cutoffTime")} style={{ ...fld, fontWeight: 700, border: "none" }}/>
             </div>
-            <div style={{ ...cellSt(36), border: "none" }}>
+            <div style={{ ...cellSt(30), border: "none" }}>
               <span style={lblSt}>FLIGHT</span>
               <input value={ls.flight} onChange={sl("flight")} style={{ ...fld, fontWeight: 700, border: "none" }}/>
             </div>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", marginBottom: 6, border: "2px solid #000000", background: "#ffffff" }}>
-            <div style={{ ...cellSt(36), border: "none", borderRight: "2px solid #000000" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", marginBottom: 4, border: "2px solid #000000", background: "#ffffff" }}>
+            <div style={{ ...cellSt(30), border: "none", borderRight: "2px solid #000000" }}>
               <span style={lblSt}>DESTINATION</span>
               <input value={ls.destination} onChange={sl("destination")} style={{ ...fld, fontWeight: 700, border: "none" }}/>
             </div>
-            <div style={{ ...cellSt(36), border: "none" }}>
+            <div style={{ ...cellSt(30), border: "none" }}>
               <span style={lblSt}>ULD</span>
               <input value={ls.uld} onChange={sl("uld")} style={{ ...fld, border: "none", fontWeight: 700 }}/>
             </div>
           </div>
 
           {/* OPTIONS BOX */}
-          <div style={{ border: "2px solid #000000", marginBottom: 6, background: "#ffffff", display: "grid", gridTemplateColumns: "1fr 1fr" }}>
+          <div style={{ border: "2px solid #000000", marginBottom: 4, background: "#ffffff", display: "grid", gridTemplateColumns: "1fr 1fr" }}>
             {/* Row 1 / Col 1: DRY ICE / GEL PACKS */}
-            <div style={{ display: "flex", alignItems: "center", padding: "6px 10px", borderRight: "2px solid #000000", borderBottom: "2px solid #000000" }}>
-              <span style={{ fontWeight: "bold", fontSize: 11, marginRight: 8, color: "#000000" }}>DRY ICE / GEL PACKS:</span>
-              <label style={{ display: "flex", alignItems: "center", gap: 4, marginRight: 12, cursor: "pointer", fontSize: 11, color: "#000000", fontWeight: "bold" }}>
-                <input type="checkbox" checked={ls.dryIceYes} onChange={(e) => setLs((s) => ({ ...s, dryIceYes: e.target.checked, dryIceNo: !e.target.checked }))} style={{ width: 14, height: 14, accentColor: "#000000" }} /> YES
+            <div style={{ display: "flex", alignItems: "center", padding: "3px 6px", borderRight: "2px solid #000000", borderBottom: "2px solid #000000" }}>
+              <span style={{ fontWeight: "bold", fontSize: 10, marginRight: 6, color: "#000000" }}>DRY ICE / GEL PACKS:</span>
+              <label style={{ display: "flex", alignItems: "center", gap: 3, marginRight: 8, cursor: "pointer", fontSize: 10, color: "#000000", fontWeight: "bold" }}>
+                <input type="checkbox" checked={ls.dryIceYes} onChange={(e) => setLs((s) => ({ ...s, dryIceYes: e.target.checked, dryIceNo: !e.target.checked }))} style={{ width: 12, height: 12, accentColor: "#000000" }} /> YES
               </label>
-              <label style={{ display: "flex", alignItems: "center", gap: 4, marginRight: 16, cursor: "pointer", fontSize: 11, color: "#000000", fontWeight: "bold" }}>
-                <input type="checkbox" checked={ls.dryIceNo} onChange={(e) => setLs((s) => ({ ...s, dryIceNo: e.target.checked, dryIceYes: !e.target.checked }))} style={{ width: 14, height: 14, accentColor: "#000000" }} /> NO
+              <label style={{ display: "flex", alignItems: "center", gap: 3, marginRight: 12, cursor: "pointer", fontSize: 10, color: "#000000", fontWeight: "bold" }}>
+                <input type="checkbox" checked={ls.dryIceNo} onChange={(e) => setLs((s) => ({ ...s, dryIceNo: e.target.checked, dryIceYes: !e.target.checked }))} style={{ width: 12, height: 12, accentColor: "#000000" }} /> NO
               </label>
-              <span style={{ fontSize: 10, fontWeight: "bold", color: "#000000", marginRight: 4 }}>AMOUNT:</span>
-              <input value={ls.dryIceAmount} onChange={sl("dryIceAmount")} style={{ ...fld, width: 80, borderBottom: "1.5px solid #000000", color: "#000000", fontWeight: "bold" }} />
+              <span style={{ fontSize: 9, fontWeight: "bold", color: "#000000", marginRight: 3 }}>AMOUNT:</span>
+              <input value={ls.dryIceAmount} onChange={sl("dryIceAmount")} style={{ ...fld, width: 60, borderBottom: "1.5px solid #000000", color: "#000000", fontWeight: "bold", fontSize: 10 }} />
             </div>
 
             {/* Row 1 / Col 2: FOIL */}
-            <div style={{ display: "flex", alignItems: "center", padding: "6px 10px", borderBottom: "2px solid #000000" }}>
-              <span style={{ fontWeight: "bold", fontSize: 11, marginRight: 12, color: "#000000" }}>FOIL REQUIRED:</span>
-              <label style={{ display: "flex", alignItems: "center", gap: 4, marginRight: 16, cursor: "pointer", fontSize: 11, color: "#000000", fontWeight: "bold" }}>
-                <input type="checkbox" checked={ls.foilYes} onChange={(e) => setLs((s) => ({ ...s, foilYes: e.target.checked, foilNo: !e.target.checked }))} style={{ width: 14, height: 14, accentColor: "#000000" }} /> YES
+            <div style={{ display: "flex", alignItems: "center", padding: "3px 6px", borderBottom: "2px solid #000000" }}>
+              <span style={{ fontWeight: "bold", fontSize: 10, marginRight: 10, color: "#000000" }}>FOIL REQUIRED:</span>
+              <label style={{ display: "flex", alignItems: "center", gap: 3, marginRight: 12, cursor: "pointer", fontSize: 10, color: "#000000", fontWeight: "bold" }}>
+                <input type="checkbox" checked={ls.foilYes} onChange={(e) => setLs((s) => ({ ...s, foilYes: e.target.checked, foilNo: !e.target.checked }))} style={{ width: 12, height: 12, accentColor: "#000000" }} /> YES
               </label>
-              <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 11, color: "#000000", fontWeight: "bold" }}>
-                <input type="checkbox" checked={ls.foilNo} onChange={(e) => setLs((s) => ({ ...s, foilNo: e.target.checked, foilYes: !e.target.checked }))} style={{ width: 14, height: 14, accentColor: "#000000" }} /> NO
+              <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer", fontSize: 10, color: "#000000", fontWeight: "bold" }}>
+                <input type="checkbox" checked={ls.foilNo} onChange={(e) => setLs((s) => ({ ...s, foilNo: e.target.checked, foilYes: !e.target.checked }))} style={{ width: 12, height: 12, accentColor: "#000000" }} /> NO
               </label>
             </div>
 
             {/* Row 2 / Col 1: TEMP RECORDER */}
-            <div style={{ display: "flex", alignItems: "center", padding: "6px 10px", borderRight: "2px solid #000000" }}>
-              <span style={{ fontWeight: "bold", fontSize: 11, marginRight: 12, color: "#000000" }}>TEMP RECORDER:</span>
-              <label style={{ display: "flex", alignItems: "center", gap: 4, marginRight: 16, cursor: "pointer", fontSize: 11, color: "#000000", fontWeight: "bold" }}>
-                <input type="checkbox" checked={ls.tempRecorderYes} onChange={(e) => setLs((s) => ({ ...s, tempRecorderYes: e.target.checked, tempRecorderNo: !e.target.checked }))} style={{ width: 14, height: 14, accentColor: "#000000" }} /> YES
+            <div style={{ display: "flex", alignItems: "center", padding: "3px 6px", borderRight: "2px solid #000000" }}>
+              <span style={{ fontWeight: "bold", fontSize: 10, marginRight: 10, color: "#000000" }}>TEMP RECORDER:</span>
+              <label style={{ display: "flex", alignItems: "center", gap: 3, marginRight: 12, cursor: "pointer", fontSize: 10, color: "#000000", fontWeight: "bold" }}>
+                <input type="checkbox" checked={ls.tempRecorderYes} onChange={(e) => setLs((s) => ({ ...s, tempRecorderYes: e.target.checked, tempRecorderNo: !e.target.checked }))} style={{ width: 12, height: 12, accentColor: "#000000" }} /> YES
               </label>
-              <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 11, color: "#000000", fontWeight: "bold" }}>
-                <input type="checkbox" checked={ls.tempRecorderNo} onChange={(e) => setLs((s) => ({ ...s, tempRecorderNo: e.target.checked, tempRecorderYes: !e.target.checked }))} style={{ width: 14, height: 14, accentColor: "#000000" }} /> NO
+              <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer", fontSize: 10, color: "#000000", fontWeight: "bold" }}>
+                <input type="checkbox" checked={ls.tempRecorderNo} onChange={(e) => setLs((s) => ({ ...s, tempRecorderNo: e.target.checked, tempRecorderYes: !e.target.checked }))} style={{ width: 12, height: 12, accentColor: "#000000" }} /> NO
               </label>
             </div>
 
             {/* Row 2 / Col 2: SEALS */}
-            <div style={{ display: "flex", alignItems: "center", padding: "6px 10px" }}>
-              <span style={{ fontWeight: "bold", fontSize: 11, marginRight: 8, color: "#000000" }}>SEALS:</span>
-              <label style={{ display: "flex", alignItems: "center", gap: 4, marginRight: 12, cursor: "pointer", fontSize: 11, color: "#000000", fontWeight: "bold" }}>
-                <input type="checkbox" checked={ls.sealsYes} onChange={(e) => setLs((s) => ({ ...s, sealsYes: e.target.checked, sealsNo: !e.target.checked }))} style={{ width: 14, height: 14, accentColor: "#000000" }} /> YES
+            <div style={{ display: "flex", alignItems: "center", padding: "3px 6px" }}>
+              <span style={{ fontWeight: "bold", fontSize: 10, marginRight: 6, color: "#000000" }}>SEALS:</span>
+              <label style={{ display: "flex", alignItems: "center", gap: 3, marginRight: 8, cursor: "pointer", fontSize: 10, color: "#000000", fontWeight: "bold" }}>
+                <input type="checkbox" checked={ls.sealsYes} onChange={(e) => setLs((s) => ({ ...s, sealsYes: e.target.checked, sealsNo: !e.target.checked }))} style={{ width: 12, height: 12, accentColor: "#000000" }} /> YES
               </label>
-              <label style={{ display: "flex", alignItems: "center", gap: 4, marginRight: 16, cursor: "pointer", fontSize: 11, color: "#000000", fontWeight: "bold" }}>
-                <input type="checkbox" checked={ls.sealsNo} onChange={(e) => setLs((s) => ({ ...s, sealsNo: e.target.checked, sealsYes: !e.target.checked }))} style={{ width: 14, height: 14, accentColor: "#000000" }} /> NO
+              <label style={{ display: "flex", alignItems: "center", gap: 3, marginRight: 12, cursor: "pointer", fontSize: 10, color: "#000000", fontWeight: "bold" }}>
+                <input type="checkbox" checked={ls.sealsNo} onChange={(e) => setLs((s) => ({ ...s, sealsNo: e.target.checked, sealsYes: !e.target.checked }))} style={{ width: 12, height: 12, accentColor: "#000000" }} /> NO
               </label>
-              <span style={{ fontSize: 10, fontWeight: "bold", color: "#000000", marginRight: 4 }}>INSPECTION REQUIRED @:</span>
-              <input value={ls.inspectionAt} onChange={sl("inspectionAt")} style={{ ...fld, width: 80, borderBottom: "1.5px solid #000000", color: "#000000", fontWeight: "bold" }} />
+              <span style={{ fontSize: 9, fontWeight: "bold", color: "#000000", marginRight: 3 }}>INSPECTION REQUIRED @:</span>
+              <input value={ls.inspectionAt} onChange={sl("inspectionAt")} style={{ ...fld, width: 60, borderBottom: "1.5px solid #000000", color: "#000000", fontWeight: "bold", fontSize: 10 }} />
             </div>
           </div>
 
           {/* CARGO TABLE */}
-          <table style={{ marginBottom: 6, fontSize: 11, width: "100%", borderCollapse: "collapse", border: "2px solid #000000" }}>
+          <table className="cargo-table" style={{ marginBottom: 4, fontSize: 12, width: "100%", borderCollapse: "collapse", border: "2px solid #000000" }}>
             <thead>
               <tr style={{ background: "#000000", color: "#ffffff" }}>
-                <th style={{ width: "22%", padding: "6px 6px", fontSize: 15, color: "#ffffff", textTransform: "uppercase", border: "2px solid #000000", fontWeight: "900" }}>GRN</th>
-                <th style={{ width: "10%", padding: "6px 6px", fontSize: 15, color: "#ffffff", textTransform: "uppercase", border: "2px solid #000000", fontWeight: "900" }}>SKD COUNT</th>
-                <th style={{ width: "10%", padding: "6px 6px", fontSize: 15, color: "#ffffff", textTransform: "uppercase", border: "2px solid #000000", fontWeight: "900" }}>COUNT</th>
-                <th style={{ padding: "6px 6px", fontSize: 15, color: "#ffffff", textTransform: "uppercase", border: "2px solid #000000", fontWeight: "900" }}>DESCRIPTION</th>
-                <th style={{ width: "12%", padding: "6px 6px", fontSize: 15, color: "#ffffff", textTransform: "uppercase", border: "2px solid #000000", fontWeight: "900" }}>WEIGHT</th>
-                <th style={{ width: "8%", padding: "6px 6px", fontSize: 15, color: "#ffffff", textTransform: "uppercase", textAlign: "center", border: "2px solid #000000", fontWeight: "900" }}>PICKED ✓</th>
-                <th style={{ width: "8%", padding: "6px 6px", fontSize: 15, color: "#ffffff", textTransform: "uppercase", textAlign: "center", border: "2px solid #000000", fontWeight: "900" }}>CHECKED ✓</th>
+                <th style={{ width: "18%", padding: "7px 6px", fontSize: 13, color: "#ffffff", textTransform: "uppercase", border: "2px solid #000000", fontWeight: "900" }}>GRN</th>
+                <th style={{ width: "8%", padding: "7px 6px", fontSize: 13, color: "#ffffff", textTransform: "uppercase", border: "2px solid #000000", fontWeight: "900" }}>SKD COUNT</th>
+                <th style={{ width: "8%", padding: "7px 6px", fontSize: 13, color: "#ffffff", textTransform: "uppercase", border: "2px solid #000000", fontWeight: "900" }}>COUNT</th>
+                <th style={{ width: "46%", padding: "7px 6px", fontSize: 13, color: "#ffffff", textTransform: "uppercase", border: "2px solid #000000", fontWeight: "900" }}>DESCRIPTION</th>
+                <th style={{ width: "10%", padding: "7px 6px", fontSize: 13, color: "#ffffff", textTransform: "uppercase", border: "2px solid #000000", fontWeight: "900" }}>WEIGHT</th>
+                <th style={{ width: "5%", padding: "7px 6px", fontSize: 13, color: "#ffffff", textTransform: "uppercase", textAlign: "center", border: "2px solid #000000", fontWeight: "900" }}>PICKED ✓</th>
+                <th style={{ width: "5%", padding: "7px 6px", fontSize: 13, color: "#ffffff", textTransform: "uppercase", textAlign: "center", border: "2px solid #000000", fontWeight: "900" }}>CHECKED ✓</th>
               </tr>
             </thead>
             <tbody>
               {ls.cargoRows.map((cr, i) => (
                 <tr key={i} style={{ background: "#ffffff" }}>
-                  <td style={{ padding: 0, border: "2px solid #000000" }}><input value={cr.grn} onChange={(e) => setCargo(i, "grn", e.target.value)} style={{ ...fld, padding: "4px 6px", border: "none", fontWeight: "bold" }} /></td>
-                  <td style={{ padding: 0, border: "2px solid #000000" }}><input value={cr.skd} onChange={(e) => setCargo(i, "skd", e.target.value)} style={{ ...fld, padding: "4px 6px", border: "none", fontWeight: "bold" }} /></td>
-                  <td style={{ padding: 0, border: "2px solid #000000" }}><input value={cr.count} onChange={(e) => setCargo(i, "count", e.target.value)} style={{ ...fld, padding: "4px 6px", border: "none", fontWeight: "bold" }} /></td>
-                  <td style={{ padding: 0, border: "2px solid #000000" }}><input value={cr.desc} onChange={(e) => setCargo(i, "desc", e.target.value)} style={{ ...fld, padding: "4px 6px", border: "none", fontWeight: "bold" }} /></td>
-                  <td style={{ padding: 0, border: "2px solid #000000" }}><input value={cr.weight} onChange={(e) => setCargo(i, "weight", e.target.value)} style={{ ...fld, padding: "4px 6px", border: "none", fontWeight: "bold" }} /></td>
-                  <td style={{ padding: 0, textAlign: "center", border: "2px solid #000000" }}>
-                    <input type="checkbox" checked={cr.picked} onChange={(e) => setCargo(i, "picked", e.target.checked)} style={{ width: 14, height: 14, cursor: "pointer", accentColor: "#000000" }} />
+                  <td style={{ padding: 0, border: "2px solid #000000" }}><input value={cr.grn} onChange={(e) => setCargo(i, "grn", e.target.value)} style={{ ...fld, padding: "9px 9px", border: "none", fontWeight: "bold", fontSize: "17px" }} /></td>
+                  <td style={{ padding: 0, border: "2px solid #000000" }}><input value={cr.skd} onChange={(e) => setCargo(i, "skd", e.target.value)} style={{ ...fld, padding: "9px 9px", border: "none", fontWeight: "bold", fontSize: "17px" }} /></td>
+                  <td style={{ padding: 0, border: "2px solid #000000" }}><input value={cr.count} onChange={(e) => setCargo(i, "count", e.target.value)} style={{ ...fld, padding: "9px 9px", border: "none", fontWeight: "bold", fontSize: "17px" }} /></td>
+                  <td style={{ padding: 0, border: "2px solid #000000" }}><input value={cr.desc} onChange={(e) => setCargo(i, "desc", e.target.value)} style={{ ...fld, padding: "9px 9px", border: "none", fontWeight: "bold", fontSize: "17px" }} /></td>
+                  <td style={{ padding: 0, border: "2px solid #000000" }}>
+                    <input 
+                      value={cr.weight} 
+                      onChange={(e) => {
+                        const input = e.target;
+                        const originalValue = input.value;
+                        const selectionStart = input.selectionStart;
+                        let clean = originalValue.toUpperCase().replace(/\s*KGS?\s*$/i, "").trim();
+                        let formatted = clean ? clean + " KG" : "";
+                        setCargo(i, "weight", formatted);
+                        if (selectionStart !== null) {
+                          setTimeout(() => {
+                            let newCursor = selectionStart;
+                            if (clean !== "") {
+                              const cleanLen = clean.length;
+                              if (selectionStart > cleanLen) {
+                                newCursor = cleanLen;
+                              }
+                            }
+                            input.setSelectionRange(newCursor, newCursor);
+                          }, 0);
+                        }
+                      }} 
+                      style={{ ...fld, padding: "9px 9px", border: "none", fontWeight: "bold", fontSize: "17px" }} 
+                    />
                   </td>
                   <td style={{ padding: 0, textAlign: "center", border: "2px solid #000000" }}>
-                    <input type="checkbox" checked={cr.checked} onChange={(e) => setCargo(i, "checked", e.target.checked)} style={{ width: 14, height: 14, cursor: "pointer", accentColor: "#000000" }} />
+                    <input type="checkbox" checked={cr.picked} onChange={(e) => setCargo(i, "picked", e.target.checked)} style={{ width: 22, height: 22, cursor: "pointer", accentColor: "#000000" }} />
+                  </td>
+                  <td style={{ padding: 0, textAlign: "center", border: "2px solid #000000" }}>
+                    <input type="checkbox" checked={cr.checked} onChange={(e) => setCargo(i, "checked", e.target.checked)} style={{ width: 22, height: 22, cursor: "pointer", accentColor: "#000000" }} />
                   </td>
                 </tr>
               ))}
               {/* Totals row */}
               <tr style={{ background: "#ffffff", fontWeight: "bold" }}>
-                <td style={{ padding: "6px 8px", fontSize: 10, textTransform: "uppercase", border: "2px solid #000000", textAlign: "right", color: "#000000", fontWeight: "900" }}>LOAD OUT TOTALS:</td>
-                <td style={{ padding: "6px 8px", fontSize: 12, border: "2px solid #000000", color: "#000000", fontWeight: "900" }}>
+                <td style={{ padding: "7px 6px", fontSize: 13, textTransform: "uppercase", border: "2px solid #000000", textAlign: "right", color: "#000000", fontWeight: "900" }}>LOAD OUT TOTALS:</td>
+                <td style={{ padding: "7px 6px", fontSize: 14, border: "2px solid #000000", color: "#000000", fontWeight: "900", textAlign: "center" }}>
                   {totalLoadOutSkd > 0 ? totalLoadOutSkd : "—"}
                 </td>
-                <td style={{ padding: "6px 8px", fontSize: 12, border: "2px solid #000000", color: "#000000", fontWeight: "900" }}>
+                <td style={{ padding: "7px 6px", fontSize: 14, border: "2px solid #000000", color: "#000000", fontWeight: "900", textAlign: "center" }}>
                   {totalLoadOutCount > 0 ? totalLoadOutCount : "—"}
                 </td>
-                <td style={{ padding: "6px 8px", fontSize: 10, border: "2px solid #000000" }}></td>
-                <td style={{ padding: "6px 8px", fontSize: 12, border: "2px solid #000000", color: "#000000", fontWeight: "900" }}>
-                  {totalLoadOutWeight > 0 ? totalLoadOutWeight.toFixed(1) : "—"}
+                <td style={{ padding: "7px 6px", fontSize: 13, border: "2px solid #000000" }}></td>
+                <td style={{ padding: "7px 6px", fontSize: 14, border: "2px solid #000000", color: "#000000", fontWeight: "900", textAlign: "center" }}>
+                  {totalLoadOutWeight > 0 ? `${totalLoadOutWeight.toFixed(1)} KG` : "—"}
                 </td>
                 <td colSpan={2} style={{ border: "2px solid #000000" }}></td>
               </tr>
@@ -1140,28 +1361,35 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
           </table>
 
           {/* UNITS & SPECIAL INSTRUCTIONS */}
-          <div style={{ background: "#000000", color: "#ffffff", fontWeight: 700, fontSize: 11, padding: "5px 10px", textTransform: "uppercase", letterSpacing: "1px", border: "2px solid #000000", borderBottom: "none" }}>UNITS & SPECIAL INSTRUCTIONS</div>
-          <div style={{ border: "2px solid #000000", padding: "6px 8px", marginBottom: 6, background: "#ffffff", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
+          <div style={{ background: "#000000", color: "#ffffff", fontWeight: 700, fontSize: 11, padding: "3px 6px", textTransform: "uppercase", letterSpacing: "1px", border: "2px solid #000000", borderBottom: "none" }}>UNITS & SPECIAL INSTRUCTIONS</div>
+          <div style={{ border: "2px solid #000000", padding: "4px 6px", marginBottom: 4, background: "#ffffff", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
             <div style={{ display: "flex", flexDirection: "column" }}>
-              <span style={{ fontSize: 9, fontWeight: "bold", color: "#000000", textTransform: "uppercase", display: "block", marginBottom: 4 }}>UNIT NUMBERS:</span>
+              <span style={{ fontSize: 9, fontWeight: "bold", color: "#000000", textTransform: "uppercase", display: "block", marginBottom: 3 }}>UNIT NUMBERS:</span>
               <textarea
                 className="with-border"
                 value={ls.unitsLine2}
                 onChange={(e) => setLs((s) => ({ ...s, unitsLine2: e.target.value.toUpperCase() }))}
-                placeholder="AKE12345QF / PMC67890AA..."
+                placeholder=""
                 style={{
                   ...fld,
                   border: "2px solid #000000",
-                  padding: "6px 8px",
+                  padding: "4px 6px",
                   fontWeight: "bold",
-                  height: "130px",
+                  height: "150px",
                   boxSizing: "border-box",
-                  resize: "none"
+                  resize: "none",
+                  fontSize: getUnitsFontSize(ls.unitsLine2),
+                  lineHeight: "1.25",
+                  overflowY: "auto"
                 }}
               />
+              <span style={{ fontSize: 9, fontWeight: "bold", color: "#000000", textTransform: "uppercase", display: "block", marginTop: 4, marginBottom: 3 }}>DYNAMIC OPTIONS STATUS:</span>
+              <div style={{ minHeight: 30, padding: "3px 6px", background: "#ffffff", border: "2px solid #000000", fontSize: 10, fontWeight: "bold", color: "#000000", display: "flex", alignItems: "center", textTransform: "uppercase" }}>
+                {getAutoSpecialInstructions() || "NO OPTIONS SELECTED"}
+              </div>
             </div>
             <div style={{ display: "flex", flexDirection: "column", position: "relative" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
                 <span style={{ fontSize: 9, fontWeight: "bold", color: "#000000", textTransform: "uppercase" }}>SPECIAL INSTRUCTIONS (FREE-TYPE):</span>
                 <button
                   type="button"
@@ -1182,7 +1410,7 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                     background: "#000000",
                     border: "1px solid #000000",
                     borderRadius: 3,
-                    padding: "2px 6px",
+                    padding: "1px 4px",
                     cursor: "pointer",
                     textTransform: "uppercase",
                     letterSpacing: "0.5px"
@@ -1206,12 +1434,12 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                 style={{
                   ...fld,
                   border: "2px solid #000000",
-                  padding: "6px 8px",
+                  padding: "4px 6px",
                   fontWeight: "bold",
-                  height: "130px",
+                  height: "170px",
                   boxSizing: "border-box",
                   resize: "none",
-                  marginBottom: 4,
+                  marginBottom: 2,
                   fontSize: getSopFontSize(ls.customSpecialInstructions),
                   lineHeight: "1.25",
                   overflowY: "auto"
@@ -1220,10 +1448,6 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
               <span className="print-hidden" style={{ fontSize: 8, color: "#64748b", fontWeight: "700", marginBottom: 4, textTransform: "uppercase" }}>
                 💡 TIP: RIGHT-CLICK TEXTAREA TO CHOOSE PRE-DEFINED CARGO TEMPLATES
               </span>
-              <span style={{ fontSize: 9, fontWeight: "bold", color: "#000000", textTransform: "uppercase", display: "block", marginBottom: 2 }}>DYNAMIC OPTIONS STATUS:</span>
-              <div style={{ minHeight: 38, padding: "4px 8px", background: "#ffffff", border: "2px solid #000000", fontSize: 11, fontWeight: "bold", color: "#000000", display: "flex", alignItems: "center", textTransform: "uppercase" }}>
-                {getAutoSpecialInstructions() || "NO OPTIONS SELECTED"}
-              </div>
 
               {templateMenu && templateMenu.visible && (
                 <>
@@ -1311,12 +1535,17 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
 
                     {/* Tab Body: Selection list */}
                     {menuMode === "select" && (() => {
-                      const sortedTemplates = [...templates].sort((a, b) => a.name.localeCompare(b.name));
+                      const targetPortValue = (row.station || activePort || "MEL").toUpperCase();
+                      const filteredByPort = templates.filter(tmpl => {
+                        const tPort = (tmpl.port || "").toUpperCase();
+                        return tPort === targetPortValue || tPort === "ALL";
+                      });
+                      const sortedTemplates = [...filteredByPort].sort((a, b) => a.name.localeCompare(b.name));
                       const filteredAndSortedTemplates = sortedTemplates.filter((tmpl) => {
-                        const query = templateSearch.toLowerCase();
+                        const queryStr = templateSearch.toLowerCase();
                         return (
-                          tmpl.name.toLowerCase().includes(query) ||
-                          tmpl.text.toLowerCase().includes(query)
+                          tmpl.name.toLowerCase().includes(queryStr) ||
+                          tmpl.text.toLowerCase().includes(queryStr)
                         );
                       });
                       
@@ -1384,7 +1613,14 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                                 }}
                                 title="Click to insert this template text"
                               >
-                                <div style={{ fontWeight: "900", marginBottom: 2 }}>{tmpl.name}</div>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
+                                  <span style={{ fontWeight: "900" }}>{tmpl.name}</span>
+                                  {isAdmin && (
+                                    <span style={{ fontSize: "8px", fontWeight: "900", background: "#f1f5f9", color: "#334155", padding: "1px 4px", borderRadius: "3.5px" }}>
+                                      {tmpl.port || "ALL"}
+                                    </span>
+                                  )}
+                                </div>
                                 <div style={{ fontSize: "8.5px", fontWeight: "normal", opacity: 0.8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                                   {tmpl.text}
                                 </div>
@@ -1403,301 +1639,357 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                     })()}
 
                     {/* Tab Body: Manage templates */}
-                    {menuMode === "manage" && (
-                      <div style={{ display: "flex", flexDirection: "column" }}>
-                        <div style={{ padding: "8px 12px", borderBottom: "1px solid #e2e8f0" }}>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setMenuMode("add");
-                              setTempName("");
-                              setTempText("");
-                              setTmplIdToDelete(null);
-                            }}
-                            style={{
-                              width: "100%",
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: "center",
-                              gap: "4px",
-                              background: "#000000",
-                              color: "#ffffff",
-                              border: "1px solid #000000",
-                              borderRadius: "3px",
-                              padding: "6px",
-                              fontSize: "10px",
-                              fontWeight: "800",
-                              cursor: "pointer",
-                              textTransform: "uppercase"
-                            }}
-                          >
-                            <Plus size={11} /> ➕ Create New Template
-                          </button>
-                        </div>
-                        <div style={{ maxHeight: "200px", overflowY: "auto" }}>
-                          {templates.map((tmpl) => (
-                            <div
-                              key={tmpl.id}
+                    {menuMode === "manage" && (() => {
+                      const targetPortValue = (row.station || activePort || "MEL").toUpperCase();
+                      const filteredManage = templates.filter(tmpl => {
+                        const tPort = (tmpl.port || "").toUpperCase();
+                        return tPort === targetPortValue || tPort === "ALL";
+                      });
+                      const sortedManage = [...filteredManage].sort((a, b) => (a.port || "").localeCompare(b.port || "") || a.name.localeCompare(b.name));
+                      
+                      return (
+                        <div style={{ display: "flex", flexDirection: "column" }}>
+                          <div style={{ padding: "8px 12px", borderBottom: "1px solid #e2e8f0" }}>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setMenuMode("add");
+                                setTempName("");
+                                setTempText("");
+                                setTempPort(targetPortValue);
+                                setTmplIdToDelete(null);
+                              }}
                               style={{
-                                padding: "8px 12px",
+                                width: "100%",
                                 display: "flex",
                                 alignItems: "center",
-                                justifyContent: "space-between",
-                                borderBottom: "1px dashed #e2e8f0",
-                                gap: 8
+                                justifyContent: "center",
+                                gap: "4px",
+                                background: "#000000",
+                                color: "#ffffff",
+                                border: "1px solid #000000",
+                                borderRadius: "3px",
+                                padding: "6px",
+                                fontSize: "10px",
+                                fontWeight: "800",
+                                cursor: "pointer",
+                                textTransform: "uppercase"
                               }}
                             >
-                              <div style={{ overflow: "hidden", flex: 1 }}>
-                                <div style={{ fontSize: "10.5px", fontWeight: "800", color: "#000000", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                                  {tmpl.name}
-                                </div>
-                                <div style={{ fontSize: "8.5px", color: "#64748b", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                                  {tmpl.text}
-                                </div>
-                              </div>
-                              <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setMenuMode("edit");
-                                    setEditTmplId(tmpl.id);
-                                    setTempName(tmpl.name);
-                                    setTempText(tmpl.text);
-                                    setTmplIdToDelete(null);
-                                  }}
-                                  style={{
-                                    padding: "4px",
-                                    background: "#f1f5f9",
-                                    border: "1px solid #000000",
-                                    borderRadius: "3px",
-                                    cursor: "pointer",
-                                    color: "#000000"
-                                  }}
-                                  title="Edit template label or content"
-                                >
-                                  <Edit size={10} />
-                                </button>
-                                {tmplIdToDelete === tmpl.id ? (
-                                  <div style={{ display: "flex", gap: 3, alignItems: "center" }}>
-                                    <span style={{ fontSize: "8px", fontWeight: "900", color: "#b91c1c", marginRight: 2 }}>SURE?</span>
-                                    <button
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        const remain = templates.filter(t => t.id !== tmpl.id);
-                                        saveTemplatesList(remain);
-                                        setTmplIdToDelete(null);
-                                      }}
-                                      style={{
-                                        padding: "2px 4px",
-                                        background: "#dc2626",
-                                        color: "#ffffff",
-                                        border: "1px solid #991b1b",
-                                        borderRadius: "2px",
-                                        fontSize: "8px",
-                                        fontWeight: "900",
-                                        cursor: "pointer",
-                                      }}
-                                    >
-                                      YES
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setTmplIdToDelete(null);
-                                      }}
-                                      style={{
-                                        padding: "2px 4px",
-                                        background: "#f1f5f9",
-                                        color: "#000000",
-                                        border: "1px solid #475569",
-                                        borderRadius: "2px",
-                                        fontSize: "8px",
-                                        fontWeight: "900",
-                                        cursor: "pointer",
-                                      }}
-                                    >
-                                      NO
-                                    </button>
+                              <Plus size={11} /> ➕ Create New Template
+                            </button>
+                          </div>
+                          <div style={{ maxHeight: "200px", overflowY: "auto" }}>
+                            {sortedManage.map((tmpl) => (
+                              <div
+                                key={tmpl.id}
+                                style={{
+                                  padding: "8px 12px",
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "space-between",
+                                  borderBottom: "1px dashed #e2e8f0",
+                                  gap: 8
+                                }}
+                              >
+                                <div style={{ overflow: "hidden", flex: 1 }}>
+                                  <div style={{ fontSize: "10.5px", fontWeight: "800", color: "#000000", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "flex", alignItems: "center", gap: 4 }}>
+                                    <span>{tmpl.name}</span>
+                                    <span style={{ fontSize: "8px", fontWeight: "900", background: "#f1f5f9", color: "#64748b", padding: "1px 3px", borderRadius: "3px" }}>
+                                      {tmpl.port || "ALL"}
+                                    </span>
                                   </div>
-                                ) : (
+                                  <div style={{ fontSize: "8.5px", color: "#64748b", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                    {tmpl.text}
+                                  </div>
+                                </div>
+                                <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
                                   <button
                                     type="button"
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      setTmplIdToDelete(tmpl.id);
+                                      setMenuMode("edit");
+                                      setEditTmplId(tmpl.id);
+                                      setTempName(tmpl.name);
+                                      setTempText(tmpl.text);
+                                      setTempPort(tmpl.port || targetPortValue);
+                                      setTmplIdToDelete(null);
                                     }}
                                     style={{
                                       padding: "4px",
-                                      background: "#fee2e2",
-                                      border: "1px solid #991b1b",
+                                      background: "#f1f5f9",
+                                      border: "1px solid #000000",
                                       borderRadius: "3px",
                                       cursor: "pointer",
-                                      color: "#991b1b"
+                                      color: "#000000"
                                     }}
-                                    title="Delete template"
+                                    title="Edit template label or content"
                                   >
-                                    <Trash2 size={10} />
+                                    <Edit size={10} />
                                   </button>
-                                )}
+                                  {tmplIdToDelete === tmpl.id ? (
+                                    <div style={{ display: "flex", gap: 3, alignItems: "center" }}>
+                                      <span style={{ fontSize: "8px", fontWeight: "900", color: "#b91c1c", marginRight: 2 }}>SURE?</span>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleDeleteExistingTemplate(tmpl.id);
+                                          setTmplIdToDelete(null);
+                                        }}
+                                        style={{
+                                          padding: "2px 4px",
+                                          background: "#dc2626",
+                                          color: "#ffffff",
+                                          border: "1px solid #991b1b",
+                                          borderRadius: "2px",
+                                          fontSize: "8px",
+                                          fontWeight: "900",
+                                          cursor: "pointer",
+                                        }}
+                                      >
+                                        YES
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setTmplIdToDelete(null);
+                                        }}
+                                        style={{
+                                          padding: "2px 4px",
+                                          background: "#f1f5f9",
+                                          color: "#000000",
+                                          border: "1px solid #475569",
+                                          borderRadius: "2px",
+                                          fontSize: "8px",
+                                          fontWeight: "900",
+                                          cursor: "pointer",
+                                        }}
+                                      >
+                                        NO
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setTmplIdToDelete(tmpl.id);
+                                      }}
+                                      style={{
+                                        padding: "4px",
+                                        background: "#fee2e2",
+                                        border: "1px solid #991b1b",
+                                        borderRadius: "3px",
+                                        cursor: "pointer",
+                                        color: "#991b1b"
+                                      }}
+                                      title="Delete template"
+                                    >
+                                      <Trash2 size={10} />
+                                    </button>
+                                  )}
+                                </div>
                               </div>
-                            </div>
-                          ))}
-                          {templates.length === 0 && (
-                            <div style={{ padding: "20px 12px", textAlign: "center", fontSize: "11px", color: "#64748b" }}>
-                              No templates configured.
-                            </div>
-                          )}
+                            ))}
+                            {sortedManage.length === 0 && (
+                              <div style={{ padding: "20px 12px", textAlign: "center", fontSize: "11px", color: "#64748b" }}>
+                                No templates configured.
+                              </div>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    )}
+                      );
+                    })()}
 
                     {/* Tab Body: Add or Edit Form */}
-                    {(menuMode === "add" || menuMode === "edit") && (
-                      <div style={{ padding: "12px", display: "flex", flexDirection: "column", gap: "10px" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setMenuMode("manage");
-                            }}
-                            style={{
-                              background: "transparent",
-                              border: "none",
-                              color: "#000000",
-                              cursor: "pointer",
-                              padding: 0,
-                              display: "flex",
-                              alignItems: "center"
-                            }}
-                          >
-                            <ArrowLeft size={13} />
-                          </button>
-                          <span style={{ fontSize: "9px", fontWeight: "950", textTransform: "uppercase", color: "#000000" }}>
-                            {menuMode === "add" ? "Create Template" : "Edit Template"}
-                          </span>
-                        </div>
-                        <div>
-                          <label style={{ fontSize: "8px", fontWeight: "900", color: "#000000", display: "block", marginBottom: "3px", textTransform: "uppercase" }}>
-                            Template label / icon:
-                          </label>
-                          <input
-                            type="text"
-                            value={tempName}
-                            onChange={(e) => setTempName(e.target.value)}
-                            placeholder="e.g. 🌡️ Pharma Priority"
-                            style={{
-                              width: "100%",
-                              fontSize: "11px",
-                              fontWeight: "bold",
-                              border: "2px solid #000000",
-                              padding: "4px 6px",
-                              borderRadius: "3px",
-                              outline: "none",
-                              background: "#ffffff"
-                            }}
-                          />
-                        </div>
-                        <div>
-                          <label style={{ fontSize: "8px", fontWeight: "900", color: "#000000", display: "block", marginBottom: "3px", textTransform: "uppercase" }}>
-                            Special instructions text:
-                          </label>
-                          <textarea
-                            value={tempText}
-                            onChange={(e) => setTempText(e.target.value)}
-                            placeholder="ENTER FULL INSTRUCTION DETAILS TO BE COPIED..."
-                            rows={4}
-                            style={{
-                              width: "100%",
-                              fontSize: "10px",
-                              fontWeight: "bold",
-                              border: "2px solid #000000",
-                              padding: "6px 8px",
-                              borderRadius: "3px",
-                              outline: "none",
-                              resize: "none",
-                              background: "#ffffff"
-                            }}
-                          />
-                        </div>
-                        <div style={{ display: "flex", gap: "6px" }}>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (!tempName.trim()) {
-                                alert("Template title is required!");
-                                return;
-                              }
-                              if (!tempText.trim()) {
-                                alert("Instruction text is required!");
-                                return;
-                              }
+                    {(menuMode === "add" || menuMode === "edit") && (() => {
+                      const targetPortValue = (row.station || activePort || "MEL").toUpperCase();
+                      
+                      return (
+                        <div style={{ padding: "12px", display: "flex", flexDirection: "column", gap: "10px" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setMenuMode("manage");
+                              }}
+                              style={{
+                                background: "transparent",
+                                border: "none",
+                                color: "#000000",
+                                cursor: "pointer",
+                                padding: 0,
+                                display: "flex",
+                                alignItems: "center"
+                              }}
+                            >
+                              <ArrowLeft size={13} />
+                            </button>
+                            <span style={{ fontSize: "9px", fontWeight: "950", textTransform: "uppercase", color: "#000000" }}>
+                              {menuMode === "add" ? "Create Template" : "Edit Template"}
+                            </span>
+                          </div>
+                          <div>
+                            <label style={{ fontSize: "8px", fontWeight: "900", color: "#000000", display: "block", marginBottom: "3px", textTransform: "uppercase" }}>
+                              Template label / icon:
+                            </label>
+                            <input
+                              type="text"
+                              value={tempName}
+                              onChange={(e) => setTempName(e.target.value)}
+                              placeholder="e.g. 🌡️ Pharma Priority"
+                              style={{
+                                width: "100%",
+                                fontSize: "11px",
+                                fontWeight: "bold",
+                                border: "2px solid #000000",
+                                padding: "4px 6px",
+                                borderRadius: "3px",
+                                outline: "none",
+                                background: "#ffffff"
+                              }}
+                            />
+                          </div>
+                          <div>
+                            <label style={{ fontSize: "8px", fontWeight: "900", color: "#000000", display: "block", marginBottom: "3px", textTransform: "uppercase" }}>
+                              Special instructions text:
+                            </label>
+                            <textarea
+                              value={tempText}
+                              onChange={(e) => setTempText(e.target.value)}
+                              placeholder="ENTER FULL INSTRUCTION DETAILS TO BE COPIED..."
+                              rows={4}
+                              style={{
+                                width: "100%",
+                                fontSize: "10px",
+                                fontWeight: "bold",
+                                border: "2px solid #000000",
+                                padding: "6px 8px",
+                                borderRadius: "3px",
+                                outline: "none",
+                                resize: "none",
+                                background: "#ffffff"
+                              }}
+                            />
+                          </div>
 
-                              if (menuMode === "add") {
-                                const newId = `custom-${Date.now()}`;
-                                const newTmpl = { id: newId, name: tempName.trim(), text: tempText.trim() };
-                                saveTemplatesList([...templates, newTmpl]);
-                              } else if (menuMode === "edit" && editTmplId) {
-                                const updated = templates.map((tmpl) =>
-                                  tmpl.id === editTmplId
-                                    ? { ...tmpl, name: tempName.trim(), text: tempText.trim() }
-                                    : tmpl
-                                );
-                                saveTemplatesList(updated);
-                              }
+                          {/* Port selection / view */}
+                          {isAdmin ? (
+                            <div>
+                              <label style={{ fontSize: "8px", fontWeight: "900", color: "#000000", display: "block", marginBottom: "3px", textTransform: "uppercase" }}>
+                                Template Port (Admin Only):
+                              </label>
+                              <select
+                                value={tempPort || targetPortValue}
+                                onChange={(e) => setTempPort(e.target.value)}
+                                style={{
+                                  width: "105%",
+                                  fontSize: "11px",
+                                  fontWeight: "bold",
+                                  border: "2px solid #000000",
+                                  padding: "4px 6px",
+                                  borderRadius: "3px",
+                                  outline: "none",
+                                  background: "#ffffff"
+                                }}
+                              >
+                                {["ALL", "MEL", "SYD", "BNE", "CNS", "PER", "ADL"].map((st) => (
+                                  <option key={st} value={st}>{st === "ALL" ? "ALL (GLOBAL)" : st}</option>
+                                ))}
+                              </select>
+                            </div>
+                          ) : (
+                            <div>
+                              <label style={{ fontSize: "8px", fontWeight: "900", color: "#000000", display: "block", marginBottom: "3px", textTransform: "uppercase" }}>
+                                Template Port:
+                              </label>
+                              <div style={{
+                                fontSize: "11px",
+                                fontWeight: "bold",
+                                border: "2px solid #e2e8f0",
+                                background: "#f8fafc",
+                                padding: "4px 6px",
+                                borderRadius: "3px",
+                                color: "#64748b"
+                              }}>
+                                📌 {tempPort || targetPortValue} (Locked to your Station)
+                              </div>
+                            </div>
+                          )}
 
-                              setMenuMode("manage");
-                              setTempName("");
-                              setTempText("");
-                              setEditTmplId(null);
-                            }}
-                            style={{
-                              flex: 1,
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: "center",
-                              gap: "4px",
-                              background: "#22c55e",
-                              color: "#ffffff",
-                              border: "1px solid #16a34a",
-                              borderRadius: "3px",
-                              padding: "6px 8px",
-                              fontSize: "10px",
-                              fontWeight: "900",
-                              cursor: "pointer",
-                              textTransform: "uppercase"
-                            }}
-                          >
-                            Save
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setMenuMode("manage");
-                              setTempName("");
-                              setTempText("");
-                              setEditTmplId(null);
-                            }}
-                            style={{
-                              flex: 1,
-                              background: "#f1f5f9",
-                              color: "#334155",
-                              border: "1px solid #cbd5e1",
-                              borderRadius: "3px",
-                              padding: "6px 8px",
-                              fontSize: "10px",
-                              fontWeight: "900",
-                              cursor: "pointer",
-                              textTransform: "uppercase"
-                            }}
-                          >
-                            Cancel
-                          </button>
+                          <div style={{ display: "flex", gap: "6px", marginTop: "4px" }}>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (!tempName.trim()) {
+                                  alert("Template title is required!");
+                                  return;
+                                }
+                                if (!tempText.trim()) {
+                                  alert("Instruction text is required!");
+                                  return;
+                                }
+
+                                const targetP = tempPort || targetPortValue;
+                                if (menuMode === "add") {
+                                  handleAddNewTemplate(tempName, tempText, targetP);
+                                } else if (menuMode === "edit" && editTmplId) {
+                                  handleEditExistingTemplate(editTmplId, tempName, tempText, targetP);
+                                }
+
+                                setMenuMode("manage");
+                                setTempName("");
+                                setTempText("");
+                                setEditTmplId(null);
+                              }}
+                              style={{
+                                flex: 1,
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                gap: "4px",
+                                background: "#22c55e",
+                                color: "#ffffff",
+                                border: "1px solid #16a34a",
+                                borderRadius: "3px",
+                                padding: "6px 8px",
+                                fontSize: "10px",
+                                fontWeight: "900",
+                                cursor: "pointer",
+                                textTransform: "uppercase"
+                              }}
+                            >
+                              Save
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setMenuMode("manage");
+                                setTempName("");
+                                setTempText("");
+                                setEditTmplId(null);
+                              }}
+                              style={{
+                                flex: 1,
+                                background: "#f1f5f9",
+                                color: "#334155",
+                                border: "1px solid #cbd5e1",
+                                borderRadius: "3px",
+                                padding: "6px 8px",
+                                fontSize: "10px",
+                                fontWeight: "900",
+                                cursor: "pointer",
+                                textTransform: "uppercase"
+                              }}
+                            >
+                              Cancel
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                    )}
+                      );
+                    })()}
 
                     <div style={{ borderTop: "2px solid #000000", margin: "0" }}>
                       <button
@@ -1728,78 +2020,34 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
             </div>
           </div>
 
-          {/* COMBINED LOAD IN, LOAD OUT & TEMP REQUIREMENTS BOX */}
-          <div style={{ border: "2px solid #000000", marginBottom: 6, background: "#ffffff", display: "grid", gridTemplateColumns: "1fr 1fr" }}>
-            {/* Left box: LOAD IN */}
-            <div style={{ borderRight: "2px solid #000000", display: "flex", flexDirection: "column" }}>
-              {/* Load In Time Row */}
-              <div style={{ padding: "6px 8px", borderBottom: "2px solid #000000", minHeight: 44, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
-                <span style={{ ...lblSt, color: "#000000", fontWeight: "bold" }}>LOAD IN TIME:</span>
-                <input value={ls.loadIn} onChange={sl("loadIn")} style={{ ...fld, border: "none", fontWeight: "bold", fontSize: "12px", color: "#000000" }}/>
-              </div>
-              {/* Load In Temperature Readings Row */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr" }}>
-                <div style={{ padding: "4px 6px", borderRight: "2px solid #000000", minHeight: 44, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
-                  <span style={{ ...lblSt, color: "#000000", fontSize: 8 }}>LOAD IN TEMP 1:</span>
-                  <div style={{ display: "flex", alignItems: "center" }}>
-                    <input value={ls.loadInTemp1} onChange={sl("loadInTemp1")} style={{ ...fld, border: "none", fontWeight: "bold", color: "#000000" }}/>
-                    <span style={{ fontSize: 10, fontWeight: "bold", color: "#000000" }}>°C</span>
-                  </div>
-                </div>
-                <div style={{ padding: "4px 6px", borderRight: "2px solid #000000", minHeight: 44, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
-                  <span style={{ ...lblSt, color: "#000000", fontSize: 8 }}>LOAD IN TEMP 2:</span>
-                  <div style={{ display: "flex", alignItems: "center" }}>
-                    <input value={ls.loadInTemp2} onChange={sl("loadInTemp2")} style={{ ...fld, border: "none", fontWeight: "bold", color: "#000000" }}/>
-                    <span style={{ fontSize: 10, fontWeight: "bold", color: "#000000" }}>°C</span>
-                  </div>
-                </div>
-                <div style={{ padding: "4px 6px", minHeight: 44, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
-                  <span style={{ ...lblSt, color: "#000000", fontSize: 8 }}>LOAD IN TEMP 3:</span>
-                  <div style={{ display: "flex", alignItems: "center" }}>
-                    <input value={ls.loadInTemp3} onChange={sl("loadInTemp3")} style={{ ...fld, border: "none", fontWeight: "bold", color: "#000000" }}/>
-                    <span style={{ fontSize: 10, fontWeight: "bold", color: "#000000" }}>°C</span>
-                  </div>
-                </div>
+          {/* TEMPERATURE REQUIREMENTS BOX */}
+          <div style={{ border: "2px solid #000000", marginBottom: 4, background: "#ffffff", display: "grid", gridTemplateColumns: "1fr 1fr 1fr" }}>
+            <div style={{ padding: "4px 6px", borderRight: "2px solid #000000", minHeight: 45, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
+              <span style={{ ...lblSt, color: "#000000", fontSize: 10, fontWeight: "bold" }}>TEMP 1:</span>
+              <div style={{ display: "flex", alignItems: "center" }}>
+                <input value={ls.loadOutTemp1} onChange={sl("loadOutTemp1")} style={{ ...fld, border: "none", fontWeight: "bold", color: "#000000", fontSize: "16px" }}/>
+                <span style={{ fontSize: 13, fontWeight: "bold", color: "#000000" }}>°C</span>
               </div>
             </div>
-
-            {/* Right box: LOAD OUT */}
-            <div style={{ display: "flex", flexDirection: "column" }}>
-              {/* Load Out Time Row */}
-              <div style={{ padding: "6px 8px", borderBottom: "2px solid #000000", minHeight: 44, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
-                <span style={{ ...lblSt, color: "#000000", fontWeight: "bold" }}>LOAD OUT TIME:</span>
-                <input value={ls.loadOut} onChange={sl("loadOut")} style={{ ...fld, border: "none", fontWeight: "bold", fontSize: "12px", color: "#000000" }}/>
+            <div style={{ padding: "4px 6px", borderRight: "2px solid #000000", minHeight: 45, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
+              <span style={{ ...lblSt, color: "#000000", fontSize: 10, fontWeight: "bold" }}>TEMP 2:</span>
+              <div style={{ display: "flex", alignItems: "center" }}>
+                <input value={ls.loadOutTemp2} onChange={sl("loadOutTemp2")} style={{ ...fld, border: "none", fontWeight: "bold", color: "#000000", fontSize: "16px" }}/>
+                <span style={{ fontSize: 13, fontWeight: "bold", color: "#000000" }}>°C</span>
               </div>
-              {/* Load Out Temperature Readings Row */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr" }}>
-                <div style={{ padding: "4px 6px", borderRight: "2px solid #000000", minHeight: 44, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
-                  <span style={{ ...lblSt, color: "#000000", fontSize: 8 }}>LOAD OUT TEMP 1:</span>
-                  <div style={{ display: "flex", alignItems: "center" }}>
-                    <input value={ls.loadOutTemp1} onChange={sl("loadOutTemp1")} style={{ ...fld, border: "none", fontWeight: "bold", color: "#000000" }}/>
-                    <span style={{ fontSize: 10, fontWeight: "bold", color: "#000000" }}>°C</span>
-                  </div>
-                </div>
-                <div style={{ padding: "4px 6px", borderRight: "2px solid #000000", minHeight: 44, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
-                  <span style={{ ...lblSt, color: "#000000", fontSize: 8 }}>LOAD OUT TEMP 2:</span>
-                  <div style={{ display: "flex", alignItems: "center" }}>
-                    <input value={ls.loadOutTemp2} onChange={sl("loadOutTemp2")} style={{ ...fld, border: "none", fontWeight: "bold", color: "#000000" }}/>
-                    <span style={{ fontSize: 10, fontWeight: "bold", color: "#000000" }}>°C</span>
-                  </div>
-                </div>
-                <div style={{ padding: "4px 6px", minHeight: 44, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
-                  <span style={{ ...lblSt, color: "#000000", fontSize: 8 }}>LOAD OUT TEMP 3:</span>
-                  <div style={{ display: "flex", alignItems: "center" }}>
-                    <input value={ls.loadOutTemp3} onChange={sl("loadOutTemp3")} style={{ ...fld, border: "none", fontWeight: "bold", color: "#000000" }}/>
-                    <span style={{ fontSize: 10, fontWeight: "bold", color: "#000000" }}>°C</span>
-                  </div>
-                </div>
+            </div>
+            <div style={{ padding: "4px 6px", minHeight: 45, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
+              <span style={{ ...lblSt, color: "#000000", fontSize: 10, fontWeight: "bold" }}>TEMP 3:</span>
+              <div style={{ display: "flex", alignItems: "center" }}>
+                <input value={ls.loadOutTemp3} onChange={sl("loadOutTemp3")} style={{ ...fld, border: "none", fontWeight: "bold", color: "#000000", fontSize: "16px" }}/>
+                <span style={{ fontSize: 13, fontWeight: "bold", color: "#000000" }}>°C</span>
               </div>
             </div>
           </div>
 
           {/* SIGN-OFF */}
-          <div style={{ background: "#000000", color: "#ffffff", fontWeight: 700, fontSize: 11, padding: "5px 10px", textTransform: "uppercase", letterSpacing: "1px", border: "2px solid #000000", borderBottom: "none" }}>Warehouse Staff Sign-Off</div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr", border: "2px solid #000000", background: "#ffffff" }}>
+          <div style={{ background: "#000000", color: "#ffffff", fontWeight: 700, fontSize: 11, padding: "3px 6px", textTransform: "uppercase", letterSpacing: "1px", border: "2px solid #000000", borderBottom: "none" }}>Warehouse Staff Sign-Off</div>
+          <div style={{ display: "grid", gridTemplateColumns: "2fr 2fr 1fr 1fr 1fr", border: "2px solid #000000", background: "#ffffff" }}>
             {[
               ["pickedBy", "PICKED BY"],
               ["checkedBy", "CHECKED BY SUPERVISOR"],
@@ -1807,11 +2055,41 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
               ["dateIn", "DATE IN"],
               ["dateOut", "DATE OUT"],
             ].map(([k, lbl], idx) => (
-              <div key={k} style={{ ...cellSt(44), border: "none", borderRight: idx < 4 ? "2px solid #000000" : "none" }}>
-                <span style={lblSt}>{lbl}</span>
-                <input value={ls[k as keyof typeof ls] as string} onChange={sl(k as keyof typeof ls)} style={{ ...fld, fontSize: 12, fontWeight: "bold", border: "none" }} />
+              <div 
+                key={k} 
+                style={{ 
+                  padding: "4px 6px", 
+                  minHeight: 76, 
+                  background: "#ffffff", 
+                  display: "flex", 
+                  flexDirection: "column", 
+                  justifyContent: "space-between",
+                  borderRight: idx < 4 ? "2px solid #000000" : "none" 
+                }}
+              >
+                <span style={{ ...lblSt, fontSize: 8, fontWeight: "900", letterSpacing: "0.02em" }}>{lbl}</span>
+                <div style={{ display: "flex", flexDirection: "column", width: "100%", marginTop: "auto" }}>
+                  <input 
+                    value={ls[k as keyof typeof ls] as string} 
+                    onChange={sl(k as keyof typeof ls)} 
+                    style={{ 
+                      border: "none", 
+                      outline: "none", 
+                      width: "100%", 
+                      fontSize: "11px", 
+                      fontFamily: "inherit", 
+                      background: "transparent", 
+                      padding: "1px 1px", 
+                      color: "#000000", 
+                      fontWeight: "bold",
+                      textAlign: "center"
+                    }} 
+                  />
+                  <div style={{ borderBottom: "2px solid #000000", width: "95%", margin: "0 auto", marginTop: "1px" }} />
+                </div>
               </div>
             ))}
+          </div>
           </div>
           </div>
 
@@ -1865,6 +2143,7 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                 paddingTop: 30,
               }}
             >
+              <div className="print-page-inner">
               {/* Editor visual indicator header - hidden when print */}
               <div
                 className="print-hidden"
@@ -1906,7 +2185,7 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
 
               {/* Title Block */}
               <div style={{ textTransform: "uppercase", textAlign: "center", fontSize: 22, fontWeight: "900", border: "2px solid #000000", padding: "6px", marginBottom: 4, letterSpacing: 2 }}>
-                SEAWAY
+                CARCASE CONTROL SHEET
               </div>
 
               {/* LARGE SHIPPER BOX */}
@@ -2188,6 +2467,7 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                   </div>
                 </div>
               </div>
+            </div>
             </div>
           )}
 

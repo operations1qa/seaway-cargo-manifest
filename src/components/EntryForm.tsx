@@ -14,6 +14,7 @@ interface EntryFormProps {
   onSave: (form: Shipment) => void;
   onCancel: () => void;
   schedule: FlightSchedule;
+  onGoToFlights?: () => void;
 }
 
 const BLANK: Omit<Shipment, "id"> = {
@@ -39,13 +40,26 @@ const BLANK: Omit<Shipment, "id"> = {
   complete: false,
 };
 
+const formatTypedDate = (val: string): string => {
+  if (!val) return "";
+  const clean = val.replace(/\D/g, "").slice(0, 8);
+  if (clean.length >= 5) {
+    return `${clean.slice(0, 2)}/${clean.slice(2, 4)}/${clean.slice(4)}`;
+  } else if (clean.length >= 3) {
+    return `${clean.slice(0, 2)}/${clean.slice(2)}`;
+  }
+  return clean;
+};
+
 export const EntryForm: React.FC<EntryFormProps> = ({
   initial,
   onSave,
   onCancel,
   schedule,
+  onGoToFlights,
 }) => {
   const DEFAULT_CTOS = ["MENZIES", "SWISSPORT", "QANTAS", "TOLL"];
+  const dateInputRef = React.useRef<HTMLInputElement | null>(null);
   
   const [form, setForm] = useState<Shipment>(() => {
     if (initial) {
@@ -63,6 +77,41 @@ export const EntryForm: React.FC<EntryFormProps> = ({
   });
 
   const [hint, setHint] = useState("");
+  const [showMismatchConfirm, setShowMismatchConfirm] = useState(false);
+
+  const checkDayMismatch = (flightCode: string, dateStr: string) => {
+    if (!flightCode || !dateStr || dateStr.length !== 8) return null;
+    const sched = schedule[flightCode.toUpperCase()];
+    if (!sched) return null;
+
+    const daysConfig = (sched.days || ".......").padEnd(7, ".");
+    const s = dateStr.replace(/\D/g, "");
+    if (s.length !== 8) return null;
+    const day = parseInt(s.slice(0, 2), 10);
+    const month = parseInt(s.slice(2, 4), 10) - 1;
+    const year = parseInt(s.slice(4), 10);
+    if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
+    
+    const dObj = new Date(year, month, day);
+    const jsDay = dObj.getDay(); // 0-6 (Sun-Sat)
+    
+    // MTWTFSS index: Monday is 0, Sunday is 6
+    const mtwtfssIdx = jsDay === 0 ? 6 : jsDay - 1;
+    const isAllocated = daysConfig[mtwtfssIdx] !== "." && daysConfig[mtwtfssIdx] !== "-" && daysConfig[mtwtfssIdx] !== " ";
+    
+    if (!isAllocated) {
+      const weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+      const dayName = weekdays[jsDay];
+      return {
+        dayName,
+        flightCode: flightCode.toUpperCase(),
+        daysConfig: sched.days || "No days allocated",
+      };
+    }
+    return null;
+  };
+
+  const dayMismatch = checkDayMismatch(form.flight, form.date);
 
   const set = (k: keyof Shipment) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
     let val = e.target.value.toUpperCase();
@@ -101,7 +150,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({
         eta: sched.eta || "",
       }));
       setHint(
-        `✓ Cutoff: ${co || "—"} · CTO: ${sched.cto} · Dest: ${sched.dest || "—"}${form.loadType === "LOOSE" ? " (−1hr LOOSE)" : ""}`
+        `✓ Cutoff: ${co || "—"} · CTO: ${sched.cto} · Origin: ${sched.origin || "MEL"} · Dest: ${sched.dest || "—"}${form.loadType === "LOOSE" ? " (−1hr LOOSE)" : ""}`
       );
     } else {
       setForm((f) => ({ ...f, flight: val }));
@@ -143,6 +192,10 @@ export const EntryForm: React.FC<EntryFormProps> = ({
       alert("⚠️ Flight number is required.");
       return;
     }
+    if (dayMismatch) {
+      setShowMismatchConfirm(true);
+      return;
+    }
     onSave(form);
   };
 
@@ -170,12 +223,79 @@ export const EntryForm: React.FC<EntryFormProps> = ({
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
         <Field label="Date (dd/mm/yyyy)">
-          <input
-            style={INP}
-            value={toDisplay(form.date)}
-            onChange={handleDate}
-            maxLength={10}
-          />
+          <div style={{ position: "relative", display: "flex", alignItems: "center", width: "100%" }}>
+            <input
+              style={{ ...INP, width: "100%", paddingRight: "36px" }}
+              placeholder="DD/MM/YYYY"
+              value={formatTypedDate(form.date)}
+              onChange={handleDate}
+              maxLength={10}
+            />
+            <div style={{ position: "absolute", right: "6px", width: "26px", height: "26px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <button
+                type="button"
+                id="visual-date-button"
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  background: "transparent",
+                  border: "none",
+                  height: "100%",
+                  width: "100%",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  color: "#475569",
+                  cursor: "pointer",
+                  padding: 0,
+                  outline: "none",
+                  pointerEvents: "none",
+                  zIndex: 1,
+                  fontSize: "14px",
+                }}
+                title="Select shipment date"
+              >
+                📅
+              </button>
+              <input
+                type="date"
+                ref={dateInputRef}
+                id="native-date-picker"
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  opacity: 0,
+                  width: "100%",
+                  height: "100%",
+                  cursor: "pointer",
+                  zIndex: 2,
+                }}
+                onChange={(e) => {
+                  const val = e.target.value; // YYYY-MM-DD
+                  if (val) {
+                    const parts = val.split("-");
+                    if (parts.length === 3) {
+                      const yr = parts[0];
+                      const mo = parts[1];
+                      const dy = parts[2];
+                      setForm((f) => ({ ...f, date: `${dy}${mo}${yr}` }));
+                    }
+                  }
+                }}
+                value={(() => {
+                  if (form.date && form.date.length === 8) {
+                    const d = form.date.slice(0, 2);
+                    const m = form.date.slice(2, 4);
+                    const y = form.date.slice(4);
+                    return `${y}-${m}-${d}`;
+                  }
+                  return "";
+                })()}
+              />
+            </div>
+          </div>
         </Field>
         <Field label="Flight Number">
           <input
@@ -253,9 +373,6 @@ export const EntryForm: React.FC<EntryFormProps> = ({
         <Field label="Commodity">
           <input style={INP} value={form.commodity} onChange={set("commodity")} />
         </Field>
-        <Field label="Unit Numbers">
-          <input style={INP} value={form.unitNum} onChange={set("unitNum")} />
-        </Field>
         <Field label="Operator Name">
           <input style={INP} value={form.operator} onChange={set("operator")} />
         </Field>
@@ -266,13 +383,39 @@ export const EntryForm: React.FC<EntryFormProps> = ({
             <option value="">BLANK</option>
           </select>
         </Field>
-        <Field label="Job Ref">
-          <input style={INP} value={form.jobRef || ""} onChange={set("jobRef")} />
-        </Field>
-        <Field label="Consol Ref">
-          <input style={INP} value={form.consolRef || ""} onChange={set("consolRef")} />
-        </Field>
+
       </div>
+      {dayMismatch && (
+        <div
+          style={{
+            background: "#fffbeb",
+            border: "1px dashed #f59e0b",
+            borderRadius: "12px",
+            padding: "12px 16px",
+            marginTop: "16px",
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            fontSize: "13px",
+            color: "#b45309",
+            fontWeight: 500,
+          }}
+        >
+          <span style={{ fontSize: "16px" }}>⚠️</span>
+          <div>
+            <strong>Warning:</strong> No flight scheduled for{" "}
+            <strong>{dayMismatch.dayName}</strong> ({toDisplay(form.date)}) on{" "}
+            <strong>{dayMismatch.flightCode}</strong>.
+            <br />
+            <span style={{ opacity: 0.9, fontSize: "11px" }}>
+              Weekly schedule for {dayMismatch.flightCode} is set to:{" "}
+              <span style={{ fontFamily: "monospace", fontWeight: 700, letterSpacing: "1px" }}>
+                {dayMismatch.daysConfig}
+              </span>
+            </span>
+          </div>
+        </div>
+      )}
       <div style={{ marginTop: 14 }}>
         <Field label="Special Instructions">
           <textarea
@@ -314,6 +457,160 @@ export const EntryForm: React.FC<EntryFormProps> = ({
           {initial?.id ? "Save Changes" : "Add Shipment"}
         </button>
       </div>
+
+      {showMismatchConfirm && dayMismatch && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(15, 23, 42, 0.65)",
+            backdropFilter: "blur(4px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 9999,
+            padding: "20px",
+          }}
+        >
+          <div
+            style={{
+              background: "#ffffff",
+              borderRadius: "20px",
+              width: "100%",
+              maxWidth: "520px",
+              padding: "30px",
+              boxShadow: "0 25px 50px -12px rgba(0, 0, 0, 0.25)",
+              border: "1px solid #e2e8f0",
+            }}
+          >
+            <div style={{ display: "flex", gap: "16px", alignItems: "flex-start", marginBottom: "20px" }}>
+              <div
+                style={{
+                  background: "#fef3c7",
+                  color: "#d97706",
+                  width: "48px",
+                  height: "48px",
+                  borderRadius: "50%",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: "24px",
+                  flexShrink: 0,
+                }}
+              >
+                ⚠️
+              </div>
+              <div>
+                <h3 style={{ fontSize: "18px", fontWeight: 800, color: "#1e293b", margin: "0 0 6px 0" }}>
+                  Flight Schedule Conflict
+                </h3>
+                <p style={{ fontSize: "14px", color: "#475569", margin: 0, lineHeight: "1.5" }}>
+                  The selected date <strong>{toDisplay(form.date)}</strong> falls on a{" "}
+                  <strong>{dayMismatch.dayName}</strong>, but there is no flight allocated on this day for{" "}
+                  <strong>{dayMismatch.flightCode}</strong> in your schedule.
+                </p>
+              </div>
+            </div>
+
+            <div
+              style={{
+                background: "#f8fafc",
+                border: "1px solid #e2e8f0",
+                borderRadius: "12px",
+                padding: "14px 18px",
+                marginBottom: "24px",
+              }}
+            >
+              <div style={{ fontSize: "12px", color: "#64748b", fontWeight: 600, textTransform: "uppercase", marginBottom: "4px" }}>
+                Current Weekly Schedule
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: "15px", fontWeight: 700, color: "#0f172a" }}>
+                  {dayMismatch.flightCode}
+                </span>
+                <span
+                  style={{
+                    fontFamily: "monospace",
+                    fontSize: "14px",
+                    fontWeight: 800,
+                    letterSpacing: "2px",
+                    background: "#e2e8f0",
+                    color: "#334155",
+                    padding: "3px 10px",
+                    borderRadius: "6px",
+                  }}
+                >
+                  {dayMismatch.daysConfig}
+                </span>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+              <button
+                onClick={() => {
+                  setShowMismatchConfirm(false);
+                  onSave(form);
+                }}
+                style={{
+                  width: "100%",
+                  background: T.accent,
+                  color: "#ffffff",
+                  padding: "12px 16px",
+                  borderRadius: "12px",
+                  border: "none",
+                  fontSize: "13px",
+                  fontWeight: 650,
+                  cursor: "pointer",
+                }}
+              >
+                Proceed & Save Anyway
+              </button>
+
+              {onGoToFlights && (
+                <button
+                  onClick={() => {
+                    setShowMismatchConfirm(false);
+                    onGoToFlights();
+                  }}
+                  style={{
+                    width: "100%",
+                    background: "#f0fdf4",
+                    border: "1px solid #bcf0da",
+                    color: "#166534",
+                    padding: "12px 16px",
+                    borderRadius: "12px",
+                    fontSize: "13px",
+                    fontWeight: 650,
+                    cursor: "pointer",
+                  }}
+                >
+                  Update Flight Schedule
+                </button>
+              )}
+
+              <button
+                onClick={() => setShowMismatchConfirm(false)}
+                style={{
+                  width: "100%",
+                  background: "#ffffff",
+                  border: "1px solid #cbd5e1",
+                  color: "#475569",
+                  padding: "12px 16px",
+                  borderRadius: "12px",
+                  fontSize: "13px",
+                  fontWeight: 500,
+                  cursor: "pointer",
+                }}
+              >
+                Cancel & Edit Date/Flight
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

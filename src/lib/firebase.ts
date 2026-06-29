@@ -38,6 +38,87 @@ export interface FirestoreErrorInfo {
   };
 }
 
+// Global interceptors to catch Quota Exceeded (resource-exhausted) errors from Firestore
+// and trigger Offline Safeguard Mode automatically while suppressing internal library noise.
+if (typeof window !== "undefined") {
+  let lastDispatched = 0;
+  const dispatchQuotaError = (msg: string) => {
+    const now = Date.now();
+    if (now - lastDispatched > 2000) {
+      lastDispatched = now;
+      const ev = new CustomEvent("seaway-firebase-error", { detail: msg });
+      window.dispatchEvent(ev);
+    }
+  };
+
+  // Intercept console.error to check for Firebase SDK's internal quota warning logs
+  const originalConsoleError = console.error;
+  console.error = (...args: any[]) => {
+    const msg = args
+      .map((arg) => {
+        if (arg instanceof Error) {
+          return arg.stack || arg.message || String(arg);
+        }
+        if (typeof arg === "object" && arg !== null) {
+          try {
+            return JSON.stringify(arg);
+          } catch (_) {
+            return String(arg);
+          }
+        }
+        return String(arg);
+      })
+      .join(" ");
+
+    const hasQuotaError =
+      msg.toLowerCase().includes("resource-exhausted") ||
+      msg.toLowerCase().includes("quota limit exceeded") ||
+      msg.toLowerCase().includes("quota exceeded") ||
+      msg.toLowerCase().includes("free daily write units") ||
+      msg.toLowerCase().includes("maximum backoff delay to prevent overloading");
+
+    if (hasQuotaError) {
+      dispatchQuotaError("Quota limit exceeded (resource-exhausted)");
+      // Suppress the noisy Firebase SDK internal error logs from polluting the console
+      return;
+    }
+
+    originalConsoleError.apply(console, args);
+  };
+
+  // Intercept unhandled promise rejections
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason;
+    const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
+
+    const hasQuotaError =
+      msg.toLowerCase().includes("resource-exhausted") ||
+      msg.toLowerCase().includes("quota limit exceeded") ||
+      msg.toLowerCase().includes("quota exceeded") ||
+      msg.toLowerCase().includes("free daily write units");
+
+    if (hasQuotaError) {
+      dispatchQuotaError("Quota limit exceeded (resource-exhausted)");
+      event.preventDefault(); // Prevent standard console log/crash
+    }
+  });
+
+  // Intercept window errors
+  window.addEventListener("error", (event) => {
+    const msg = event.message || "";
+    const hasQuotaError =
+      msg.toLowerCase().includes("resource-exhausted") ||
+      msg.toLowerCase().includes("quota limit exceeded") ||
+      msg.toLowerCase().includes("quota exceeded") ||
+      msg.toLowerCase().includes("free daily write units");
+
+    if (hasQuotaError) {
+      dispatchQuotaError("Quota limit exceeded (resource-exhausted)");
+      event.preventDefault(); // Prevent standard console log/crash
+    }
+  });
+}
+
 export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
   const errorMessage = error instanceof Error ? error.message : String(error);
   const errInfo: FirestoreErrorInfo = {
@@ -56,6 +137,21 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
     operationType,
     path,
   };
+  
+  const isQuotaError =
+    errorMessage.toLowerCase().includes("resource-exhausted") ||
+    errorMessage.toLowerCase().includes("quota limit exceeded") ||
+    errorMessage.toLowerCase().includes("quota exceeded") ||
+    errorMessage.toLowerCase().includes("free daily write units");
+
+  if (isQuotaError) {
+    if (typeof window !== "undefined") {
+      const ev = new CustomEvent("seaway-firebase-error", { detail: "Quota limit exceeded (resource-exhausted)" });
+      window.dispatchEvent(ev);
+    }
+    return;
+  }
+
   console.error("Firestore Error: ", JSON.stringify(errInfo));
   
   if (typeof window !== "undefined") {

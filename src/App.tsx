@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { 
   Plane, 
   Layers, 
@@ -21,7 +21,9 @@ import {
   Smartphone,
   Monitor,
   Calendar,
-  Mail
+  Mail,
+  Globe,
+  BookOpen
 } from "lucide-react";
 import { Shipment, FlightSchedule } from "./types";
 import { DEFAULT_SCHEDULE, SEED_DATA } from "./data/mockData";
@@ -32,35 +34,31 @@ import { FlightAdmin } from "./components/FlightAdmin";
 import { DateRangeSearch } from "./components/DateRangeSearch";
 import { JobSheetModal } from "./components/JobSheetModal";
 import { LoadsheetModal } from "./components/LoadsheetModal";
+import { CargoTemplatesSettingsAdmin } from "./components/CargoTemplatesSettingsAdmin";
 import { InviteModal } from "./components/InviteModal";
 import { SeawayLogo } from "./components/SeawayLogo";
 import { subtractHour, todayStr, toDisplay } from "./utils/helpers";
-import { doc, getDoc, setDoc, deleteDoc, updateDoc, collection, onSnapshot, query, where } from "firebase/firestore";
+import { doc, getDoc, setDoc, deleteDoc, updateDoc, collection, onSnapshot, query, where, writeBatch } from "firebase/firestore";
 import { onAuthStateChanged, signInWithPopup, signOut, User } from "firebase/auth";
 import { auth, db, googleProvider, OperationType, handleFirestoreError } from "./lib/firebase";
 
 const STATION_PROFILES = [
   {
-    name: "Melbourne Export Air (MAP)",
-    email: "melexpair@seaway.com.au",
+    name: "Moe Khalil",
+    email: "moeykhalil0@gmail.com",
     code: "SW-P9VGV1E1NA",
-    color: "#0284c7", // Sky Blue
-    initials: "MAP",
-  },
-  {
-    name: "MELAIRWAY",
-    email: "mel.exports@airway.com.au",
-    code: "SW-P9VGV1E1NA",
-    color: "#6366f1", // Indigo
-    initials: "MA",
-  },
-  {
-    name: "Mel Airport Warehouse",
-    email: "map.warehouse@airway.com.au",
-    code: "SW-P9VGV1E1NA",
-    color: "#eab308", // Amber
-    initials: "MAW",
-  },
+    color: "#0f172a", // Slate
+    initials: "MK",
+  }
+];
+
+const ALL_STATIONS = [
+  { value: "MEL", label: "MEL (Melbourne)" },
+  { value: "SYD", label: "SYD (Sydney)" },
+  { value: "BNE", label: "BNE (Brisbane)" },
+  { value: "CNS", label: "CNS (Cairns)" },
+  { value: "PER", label: "PER (Perth)" },
+  { value: "ADL", label: "ADL (Adelaide)" },
 ];
 
 export default function App() {
@@ -69,23 +67,52 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
 
   // Passcode-based Direct Workspace Access State (coworkers bypass Google login)
-  const [guestUser, setGuestUser] = useState<{ uid: string; displayName: string; email: string } | null>(() => {
+  const [guestUser, setGuestUser] = useState<{ uid: string; displayName: string; email: string; role?: string; station?: string } | null>(() => {
     const savedId = localStorage.getItem("seaway_guest_id");
     const savedName = localStorage.getItem("seaway_guest_name");
     const savedEmail = localStorage.getItem("seaway_guest_email");
+    const savedRole = localStorage.getItem("seaway_guest_role");
+    const savedStation = localStorage.getItem("seaway_guest_station");
     if (savedId && savedName) {
-      return { uid: savedId, displayName: savedName, email: savedEmail || "guest@seaway.com" };
+      return { 
+        uid: savedId, 
+        displayName: savedName, 
+        email: savedEmail || "guest@seaway.com",
+        role: savedRole || "Admin User",
+        station: savedStation || "MEL"
+      };
     }
     return null;
   });
 
   const currentUser = user || guestUser;
 
+  const [selectedPort, setSelectedPort] = useState<string>(() => {
+    return localStorage.getItem("seaway_active_port") || "MEL";
+  });
+
   const [selectedProfile, setSelectedProfile] = useState<{ name: string; email: string; code: string; color: string; initials: string } | null>(null);
   const [pinInput, setPinInput] = useState<string>("");
   const [pinError, setPinError] = useState<string>("");
   const [submittingAuth, setSubmittingAuth] = useState(false);
   const [authError, setAuthError] = useState("");
+
+  // Dynamic login credentials inputs state
+  const [loginUsername, setLoginUsername] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginStation, setLoginStation] = useState("MEL");
+
+  // Passcode reset state
+  const [isResettingPassword, setIsResettingPassword] = useState(false);
+  const [resetEmail, setResetEmail] = useState("");
+  const [resetStation, setResetStation] = useState("MEL");
+  const [resetName, setResetName] = useState("");
+  const [resetNewPassword, setResetNewPassword] = useState("");
+  const [resetError, setResetError] = useState("");
+  const [resetSuccess, setResetSuccess] = useState("");
+  const [isSubmittingReset, setIsSubmittingReset] = useState(false);
+  const [copiedShareCode, setCopiedShareCode] = useState(false);
+  const [copiedDirectLink, setCopiedDirectLink] = useState(false);
 
   // In-App Staff Accounts/Passcode Ledger States
   const [workUsers, setWorkUsers] = useState<any[]>([]);
@@ -95,10 +122,16 @@ export default function App() {
   const [adminAddError, setAdminAddError] = useState("");
   const [adminAddSuccess, setAdminAddSuccess] = useState("");
   const [isSubmittingAdminUser, setIsSubmittingAdminUser] = useState(false);
-  const [activeInviteUser, setActiveInviteUser] = useState<{ displayName: string; email: string; passcode: string } | null>(null);
+  const [activeInviteUser, setActiveInviteUser] = useState<{ displayName: string; email: string; passcode: string; station?: string } | null>(null);
+  const [adminAddStation, setAdminAddStation] = useState("MEL");
+  const [adminAddRole, setAdminAddRole] = useState("Standard user");
+  const [editingAccount, setEditingAccount] = useState<any | null>(null);
+  const [passwordResetTarget, setPasswordResetTarget] = useState<any | null>(null);
+  const [newPasswordValue, setNewPasswordValue] = useState("");
 
   // States synchronized from Cloud Storage
   const [records, setRecords] = useState<Shipment[]>([]);
+  const recentlyDeletedIds = useRef<Set<number>>(new Set());
   const [schedule, setSchedule] = useState<FlightSchedule>(DEFAULT_SCHEDULE);
 
   // Workspace state to allow real-time cross-device collaboration in Company Mode
@@ -126,15 +159,46 @@ export default function App() {
   });
   const [showWorkspaceModal, setShowWorkspaceModal] = useState(false);
   const [dbError, setDbError] = useState<string>("");
+  const [quotaExceeded, setQuotaExceeded] = useState<boolean>(() => {
+    if (typeof window !== "undefined") {
+      return localStorage.getItem("seaway_quota_exceeded") === "true";
+    }
+    return false;
+  });
   const [offlineMode, setOfflineMode] = useState<boolean>(() => {
     if (typeof window !== "undefined") {
-      return localStorage.getItem("seaway_offline_mode") === "true";
+      return localStorage.getItem("seaway_quota_exceeded") === "true" || localStorage.getItem("seaway_offline_mode") === "true";
     }
     return false;
   });
 
-  const [activeTab, setActiveTab] = useState<"manifest" | "search" | "add" | "flights">("manifest");
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem("seaway_quota_exceeded", quotaExceeded ? "true" : "false");
+      if (quotaExceeded) {
+        setOfflineMode(true);
+      }
+    }
+  }, [quotaExceeded]);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem("seaway_offline_mode", offlineMode ? "true" : "false");
+    }
+  }, [offlineMode]);
+
+  const [activeTab, setActiveTab] = useState<"manifest" | "search" | "add" | "flights" | "settings">("manifest");
+  const [settingsSubTab, setSettingsSubTab] = useState<"setup" | "info" | "templates" | "flights">("setup");
   const [editingShipment, setEditingShipment] = useState<Shipment | null>(null);
+  const [highlightFlight, setHighlightFlight] = useState<string | null>(null);
+
+  const handleGoToFlightSchedule = (flightCode: string) => {
+    if (!flightCode) return;
+    setHighlightFlight(flightCode);
+    setActiveTab("settings");
+    setSettingsSubTab("flights");
+  };
+  const [sandboxAdminOverride, setSandboxAdminOverride] = useState(false);
 
   // Modal displays
   const [activeJobSheet, setActiveJobSheet] = useState<Shipment | null>(null);
@@ -147,6 +211,7 @@ export default function App() {
     return email === "melexpair@seaway.com.au" || 
            email === "mel.exports@airway.com.au" || 
            email === "map.warehouse@airway.com.au" ||
+           email === "moeykhalil0@gmail.com" ||
            uid.includes("melexpair") ||
            uid.includes("mel_exports") ||
            uid.includes("map_warehouse") ||
@@ -180,68 +245,253 @@ export default function App() {
   };
 
   const handleProfileSignIn = async (profile: any, pin: string, remainsOffline: boolean = false) => {
-    if (pin !== "1234") {
-      setPinError("❌ Invalid Security PIN. Please try again.");
-      return;
-    }
-    
     setSubmittingAuth(true);
     setPinError("");
     
     // Standard logins automatically cloud-synchronize by setting offline mode to false
-    const shouldBeOffline = remainsOffline;
+    const shouldBeOffline = remainsOffline || quotaExceeded;
     if (!shouldBeOffline) {
       setOfflineMode(false);
-      localStorage.setItem("seaway_offline_mode", "false");
     }
     
     try {
       const email = profile.email;
-      const passcode = "1234";
       const safeDocId = email.replace(/[@.]/g, "_");
       
       let uid = `guest_${safeDocId}_seaway_local`;
       let displayName = profile.name;
+      let dbPasscode = "1234"; // Default passcode
+      let dbRole = "Admin User"; // Builtins default to Admin User
+      let dbStation = "MEL";
       
       if (!shouldBeOffline) {
         try {
           const userRef = doc(db, "work_users", safeDocId);
           const userSnap = await getDoc(userRef);
           if (!userSnap.exists()) {
+            // Create default user entry if signature is one of the initial presets
             await setDoc(userRef, {
               uid,
               displayName,
               email,
-              passcode,
+              passcode: "1234",
+              station: "MEL",
+              role: "Admin User",
               createdAt: new Date().toISOString(),
             });
           } else {
             const data = userSnap.data();
             uid = data.uid || uid;
             displayName = data.displayName || displayName;
+            dbPasscode = data.passcode || "1234";
+            dbRole = data.role || "Standard user";
+            dbStation = data.station || "MEL";
           }
         } catch (dbErr) {
           console.warn("Database failed to load profile, bypassing to local mode:", dbErr);
-          setOfflineMode(true);
-          localStorage.setItem("seaway_offline_mode", "true");
+          // Look inside local workUsers array as fallback
+          const localUser = workUsers.find(u => u.email.toLowerCase() === email.toLowerCase());
+          if (localUser) {
+            dbPasscode = localUser.passcode || "1234";
+            displayName = localUser.displayName || displayName;
+            uid = localUser.uid || uid;
+            dbRole = localUser.role || "Standard user";
+            dbStation = localUser.station || "MEL";
+          }
         }
+      } else {
+        // Look inside local workUsers array as fallback
+        const localUser = workUsers.find(u => u.email.toLowerCase() === email.toLowerCase());
+        if (localUser) {
+          dbPasscode = localUser.passcode || "1234";
+          displayName = localUser.displayName || displayName;
+          uid = localUser.uid || uid;
+          dbRole = localUser.role || "Standard user";
+          dbStation = localUser.station || "MEL";
+        }
+      }
+
+      // Validate the pin/password
+      if (pin !== dbPasscode) {
+        setPinError("❌ Invalid password or passcode. Please try again.");
+        setSubmittingAuth(false);
+        return;
       }
       
       localStorage.setItem("seaway_guest_id", uid);
       localStorage.setItem("seaway_guest_name", displayName);
       localStorage.setItem("seaway_guest_email", email);
+      localStorage.setItem("seaway_guest_role", dbRole);
+      localStorage.setItem("seaway_guest_station", dbStation);
       
       // Automatically connect to the dedicated workspace SW-P9VGV1E1NA
       setWorkspaceId("SW-P9VGV1E1NA");
       setWorkspaceName("Melbourne Export Air (MAP) Workspace");
       
-      setGuestUser({ uid, displayName, email });
+      setGuestUser({ uid, displayName, email, role: dbRole, station: dbStation });
       setSelectedProfile(null);
       setPinInput("");
     } catch (err: any) {
       setPinError("Sign-In Error: " + err.message);
     } finally {
       setSubmittingAuth(false);
+    }
+  };
+
+  const handleLoginSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!loginUsername.trim()) {
+      setPinError("⚠️ Please enter your User name or Email.");
+      return;
+    }
+    if (!loginPassword.trim()) {
+      setPinError("⚠️ Please enter your Password.");
+      return;
+    }
+    
+    setSubmittingAuth(true);
+    setPinError("");
+    
+    const uName = loginUsername.trim().toLowerCase();
+    const uPass = loginPassword.trim();
+    
+    // Check built-ins first
+    let matchedProfile: any = null;
+    const foundBuiltIn = STATION_PROFILES.find(p => 
+      p.email.toLowerCase() === uName || 
+      p.name.toLowerCase() === uName ||
+      p.initials.toLowerCase() === uName
+    );
+    
+    if (foundBuiltIn) {
+      matchedProfile = {
+        name: foundBuiltIn.name,
+        email: foundBuiltIn.email,
+        role: "Admin User",
+        station: loginStation,
+        passcode: "1234",
+      };
+    } else {
+      // Check Firestore dynamic workUsers
+      const foundDynamic = workUsers.find(u => 
+        u.email.toLowerCase() === uName || 
+        uName === (u.displayName || "").toLowerCase()
+      );
+      if (foundDynamic) {
+        matchedProfile = {
+          name: foundDynamic.displayName,
+          email: foundDynamic.email,
+          role: foundDynamic.role || "Standard user",
+          station: foundDynamic.station || loginStation,
+          passcode: foundDynamic.passcode,
+        };
+      }
+    }
+    
+    if (!matchedProfile) {
+      setPinError("❌ No administration account found with that User name.");
+      setSubmittingAuth(false);
+      return;
+    }
+    
+    if (uPass !== matchedProfile.passcode) {
+      setPinError("❌ Incorrect password. Please try again.");
+      setSubmittingAuth(false);
+      return;
+    }
+    
+    // Successfully found & verified
+    try {
+      const docId = `guest_${matchedProfile.email.replace(/[@.]/g, "_")}_seaway_local`;
+      localStorage.setItem("seaway_guest_id", docId);
+      localStorage.setItem("seaway_guest_name", matchedProfile.name);
+      localStorage.setItem("seaway_guest_email", matchedProfile.email);
+      localStorage.setItem("seaway_guest_role", matchedProfile.role);
+      localStorage.setItem("seaway_guest_station", matchedProfile.station);
+      
+      setWorkspaceId("SW-P9VGV1E1NA");
+      setWorkspaceName("Melbourne Export Air (MAP) Workspace");
+      if (!quotaExceeded) {
+        setOfflineMode(false);
+      }
+      
+      setGuestUser({ 
+        uid: docId, 
+        displayName: matchedProfile.name, 
+        email: matchedProfile.email, 
+        role: matchedProfile.role, 
+        station: matchedProfile.station 
+      });
+      
+      setPinInput("");
+      setPinError("");
+    } catch (err: any) {
+      setPinError("Sign-In Error: " + err.message);
+    } finally {
+      setSubmittingAuth(false);
+    }
+  };
+
+  const handlePasswordResetSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setResetError("");
+    setResetSuccess("");
+    
+    const emailLower = resetEmail.trim().toLowerCase();
+    const nameLower = resetName.trim().toLowerCase();
+    const newPass = resetNewPassword.trim();
+    
+    if (!emailLower || !nameLower || !newPass) {
+      setResetError("⚠️ Please populate all fields to verify your dispatch account.");
+      return;
+    }
+    
+    // Check built-ins first
+    const isBuiltIn = STATION_PROFILES.some(p => p.email.toLowerCase() === emailLower);
+    if (isBuiltIn) {
+      setResetError("❌ Built-in station accounts cannot be modified via self-reset. Please register a unique dispatcher profile or use standard password '1234'.");
+      return;
+    }
+    
+    // Look up in dynamic workUsers
+    const safeDocId = emailLower.replace(/[@.]/g, "_");
+    const matchedUser = workUsers.find(u => u.email.toLowerCase() === emailLower);
+    
+    if (!matchedUser) {
+      setResetError("❌ No registered administration account found with that Email Address.");
+      return;
+    }
+    
+    if (matchedUser.displayName.toLowerCase() !== nameLower) {
+      setResetError("❌ Staff name does not match the registered user record for this email.");
+      return;
+    }
+    
+    setIsSubmittingReset(true);
+    try {
+      const updatedLocalUsers = workUsers.map(u => 
+        u.email.toLowerCase() === emailLower ? { ...u, passcode: newPass } : u
+      );
+      setWorkUsers(updatedLocalUsers);
+      localStorage.setItem("fallback_work_users", JSON.stringify(updatedLocalUsers));
+
+      if (!offlineMode) {
+        // Update in Firestore
+        const userRef = doc(db, "work_users", safeDocId);
+        await updateDoc(userRef, {
+          passcode: newPass
+        });
+      }
+      setResetSuccess("✓ Password updated successfully! You can now back out and sign in with your new password.");
+      
+      // Clear inputs
+      setResetEmail("");
+      setResetName("");
+      setResetNewPassword("");
+    } catch (err: any) {
+      setResetError("Database action failing: " + err.message);
+    } finally {
+      setIsSubmittingReset(false);
     }
   };
 
@@ -257,7 +507,16 @@ export default function App() {
   // Listen for real-time Firebase DB connection exceptions
   useEffect(() => {
     const handleErr = (e: any) => {
-      setDbError(e.detail || "Unknown Cloud Database error");
+      const errMsg = e.detail || "Unknown Cloud Database error";
+      setDbError(errMsg);
+      if (
+        errMsg.toLowerCase().includes("quota") ||
+        errMsg.toLowerCase().includes("exhausted") ||
+        errMsg.toLowerCase().includes("billing")
+      ) {
+        setQuotaExceeded(true);
+        setOfflineMode(true);
+      }
     };
     if (typeof window !== "undefined") {
       window.addEventListener("seaway-firebase-error", handleErr);
@@ -321,16 +580,17 @@ export default function App() {
       }
 
       // Load schedules
-      const localSchedule = localStorage.getItem(`fallback_schedules_${workspaceId || "sandbox"}`);
+      const localSchedule = localStorage.getItem(`fallback_schedules_${workspaceId || "sandbox"}_${selectedPort}`);
       if (localSchedule) {
         try {
           setSchedule(JSON.parse(localSchedule));
         } catch (e) {
-          setSchedule(DEFAULT_SCHEDULE);
+          setSchedule(selectedPort === "MEL" ? DEFAULT_SCHEDULE : {});
         }
       } else {
-        setSchedule(DEFAULT_SCHEDULE);
-        localStorage.setItem(`fallback_schedules_${workspaceId || "sandbox"}`, JSON.stringify(DEFAULT_SCHEDULE));
+        const fallSched = selectedPort === "MEL" ? DEFAULT_SCHEDULE : {};
+        setSchedule(fallSched);
+        localStorage.setItem(`fallback_schedules_${workspaceId || "sandbox"}_${selectedPort}`, JSON.stringify(fallSched));
       }
 
       // Load work_users
@@ -345,7 +605,7 @@ export default function App() {
         setWorkUsers([]);
       }
     }
-  }, [offlineMode, workspaceId, currentUser]);
+  }, [offlineMode, workspaceId, currentUser, selectedPort]);
 
   // Monitor real-time user Shipments in Firestore (scoping dynamically to active workspace)
   useEffect(() => {
@@ -366,7 +626,10 @@ export default function App() {
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const fetched: Shipment[] = [];
       snapshot.forEach((doc) => {
-        fetched.push(doc.data() as Shipment);
+        const item = doc.data() as Shipment;
+        if (!item.isDeleted && !recentlyDeletedIds.current.has(Number(item.id))) {
+          fetched.push(item);
+        }
       });
 
       // Sort shipments standard DESC safely
@@ -400,11 +663,11 @@ export default function App() {
     return () => unsubscribe();
   }, [currentUser, workspaceId, offlineMode]);
 
-  // Monitor real-time custom flight mapping overrides in Firestore (workspace-scoped)
+  // Monitor real-time custom flight mapping overrides in Firestore (workspace-scoped, partitioned by port)
   useEffect(() => {
     if (offlineMode) return;
     if (!currentUser || !workspaceId) {
-      setSchedule(DEFAULT_SCHEDULE);
+      setSchedule(selectedPort === "MEL" ? DEFAULT_SCHEDULE : {});
       return;
     }
 
@@ -415,43 +678,57 @@ export default function App() {
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const fetched: FlightSchedule = {};
+      const deletedFlights = new Set<string>();
       snapshot.forEach((doc) => {
         const item = doc.data();
-        if (item.flightCode) {
-          fetched[item.flightCode] = {
-            cutoff: item.cutoff || "",
-            dest: item.dest || "",
-            cto: item.cto || "",
-            etd: item.etd || "",
-            eta: item.eta || "",
-            airline: item.airline || "",
-            days: item.days || "",
-          };
+        if (item.flightCode && (item.station === selectedPort || (!item.station && selectedPort === "MEL"))) {
+          if (item.isDeleted) {
+            deletedFlights.add(item.flightCode);
+          } else {
+            fetched[item.flightCode] = {
+              cutoff: item.cutoff || "",
+              dest: item.dest || "",
+              cto: item.cto || "",
+              etd: item.etd || "",
+              eta: item.eta || "",
+              airline: item.airline || "",
+              days: item.days || "",
+              emailContacts: item.emailContacts || "",
+              contactPhone: item.contactPhone || "",
+              bookingPortal: item.bookingPortal || "",
+              bookingNotes: item.bookingNotes || "",
+            };
+          }
         }
       });
 
+      const baseSchedule = selectedPort === "MEL" ? { ...DEFAULT_SCHEDULE } : {};
+      deletedFlights.forEach((f) => {
+        delete baseSchedule[f];
+      });
+
       const merged = {
-        ...DEFAULT_SCHEDULE,
+        ...baseSchedule,
         ...fetched,
       };
       setSchedule(merged);
-      localStorage.setItem(`fallback_schedules_${workspaceId}`, JSON.stringify(merged));
+      localStorage.setItem(`fallback_schedules_${workspaceId}_${selectedPort}`, JSON.stringify(merged));
     }, (error) => {
       handleFirestoreError(error, OperationType.LIST, "schedules");
-      const fallbackStr = localStorage.getItem(`fallback_schedules_${workspaceId}`);
+      const fallbackStr = localStorage.getItem(`fallback_schedules_${workspaceId}_${selectedPort}`);
       if (fallbackStr) {
         try {
           setSchedule(JSON.parse(fallbackStr));
         } catch (e) {
-          setSchedule(DEFAULT_SCHEDULE);
+          setSchedule(selectedPort === "MEL" ? DEFAULT_SCHEDULE : {});
         }
       } else {
-        setSchedule(DEFAULT_SCHEDULE);
+        setSchedule(selectedPort === "MEL" ? DEFAULT_SCHEDULE : {});
       }
     });
 
     return () => unsubscribe();
-  }, [currentUser, workspaceId, offlineMode]);
+  }, [currentUser, workspaceId, offlineMode, selectedPort]);
 
   // Monitor real-time corporate work users ledger
   useEffect(() => {
@@ -490,22 +767,26 @@ export default function App() {
     return () => unsubscribe();
   }, [offlineMode]);
 
-  // Manual admin/manager action to pre-record a coworker email & passcode
+  // Manual admin/manager action to pre-record a coworker email & password
   const handleAdminRegisterUser = async () => {
+    if (!isUserAdminCurrent()) {
+      setAdminAddError("Unauthorized: Only administrator accounts can create users.");
+      return;
+    }
     const rawEmail = adminAddEmail.trim().toLowerCase();
     const rawPasscode = adminAddPasscode.trim();
     const rawName = adminAddName.trim();
 
     if (!rawEmail) {
-      setAdminAddError("Corporate/Work Email is required.");
+      setAdminAddError("Email Address is required.");
       return;
     }
     if (!rawPasscode || rawPasscode.length < 4) {
-      setAdminAddError("Passcode must be at least 4 characters.");
+      setAdminAddError("Password must be at least 4 characters.");
       return;
     }
     if (!rawName) {
-      setAdminAddError("Staff Display Name is required.");
+      setAdminAddError("Staff name is required.");
       return;
     }
 
@@ -515,13 +796,23 @@ export default function App() {
 
     try {
       const safeDocId = rawEmail.replace(/[@.]/g, "_");
-      const userRef = doc(db, "work_users", safeDocId);
-      const userSnap = await getDoc(userRef);
+      const userExistsLocally = workUsers.some(u => u.email.toLowerCase() === rawEmail);
 
-      if (userSnap.exists()) {
-        setAdminAddError("A coworker with this email has already been registered.");
-        setIsSubmittingAdminUser(false);
-        return;
+      if (offlineMode) {
+        if (userExistsLocally) {
+          setAdminAddError("An account with this email has already been registered.");
+          setIsSubmittingAdminUser(false);
+          return;
+        }
+      } else {
+        const userRef = doc(db, "work_users", safeDocId);
+        const userSnap = await getDoc(userRef);
+
+        if (userSnap.exists()) {
+          setAdminAddError("An account with this email has already been registered.");
+          setIsSubmittingAdminUser(false);
+          return;
+        }
       }
 
       const newUid = `guest_${safeDocId}_${Math.random().toString(36).substring(2, 6)}`;
@@ -530,11 +821,21 @@ export default function App() {
         displayName: rawName,
         email: rawEmail,
         passcode: rawPasscode,
+        station: adminAddStation.trim() || "MEL",
+        role: adminAddRole || "Standard user",
         createdAt: new Date().toISOString(),
       };
 
-      await setDoc(userRef, userData);
-      setAdminAddSuccess(`Registered! "${rawName}" can now login with passcode: "${rawPasscode}".`);
+      const updatedLocalUsers = [...workUsers, { id: safeDocId, ...userData }];
+      setWorkUsers(updatedLocalUsers);
+      localStorage.setItem("fallback_work_users", JSON.stringify(updatedLocalUsers));
+
+      if (!offlineMode) {
+        const userRef = doc(db, "work_users", safeDocId);
+        await setDoc(userRef, userData);
+      }
+      
+      setAdminAddSuccess(`Registered! "${rawName}" can now login with password/passcode: "${rawPasscode}".`);
       setActiveInviteUser({
         displayName: rawName,
         email: rawEmail,
@@ -543,6 +844,8 @@ export default function App() {
       setAdminAddEmail("");
       setAdminAddPasscode("1234");
       setAdminAddName("");
+      setAdminAddStation("MEL");
+      setAdminAddRole("Standard user");
     } catch (err: any) {
       console.error("Admin user registration error: ", err);
       setAdminAddError("Failed to add user: " + err.message);
@@ -551,10 +854,274 @@ export default function App() {
     }
   };
 
+  const isUserAdminCurrent = () => {
+    if (!currentUser) return false;
+    const emailLower = currentUser.email?.toLowerCase();
+    
+    // Explicitly grant full admin override privilege to primary workspace developer and owner
+    if (emailLower === "moeykhalil0@gmail.com") return true;
+
+    const isBuiltIn = STATION_PROFILES.some(p => p.email.toLowerCase() === emailLower);
+    if (isBuiltIn) return true;
+
+    // Check dynamic registered coworker/teammate profiles
+    const matched = workUsers.find(u => u.email.toLowerCase() === emailLower);
+    if (matched && matched.role === "Admin User") return true;
+
+    return (currentUser as any).role === "Admin User";
+  };
+
+  // Synchronize active / selected port context
+  useEffect(() => {
+    if (currentUser) {
+      const userStation = (currentUser as any).station || "MEL";
+      const isAdmin = isUserAdminCurrent();
+      if (!isAdmin) {
+        setSelectedPort(userStation);
+        localStorage.setItem("seaway_active_port", userStation);
+      } else {
+        const saved = localStorage.getItem("seaway_active_port");
+        if (saved) {
+          setSelectedPort(saved);
+        } else {
+          setSelectedPort(userStation);
+          localStorage.setItem("seaway_active_port", userStation);
+        }
+      }
+    }
+  }, [currentUser, workUsers]);
+
+  const isTabAllowed = (tabId: string) => {
+    if (!currentUser) return false;
+    
+    const emailLower = currentUser.email?.toLowerCase();
+    
+    // Built-in station profiles are always full Admin User
+    const isBuiltIn = STATION_PROFILES.some(p => p.email.toLowerCase() === emailLower);
+    if (isBuiltIn) return true;
+    
+    // If the role is specifically Admin User, allow all tabs
+    if ((currentUser as any).role === "Admin User") return true;
+    
+    // Look up within the dynamic users
+    const matched = workUsers.find(u => u.email.toLowerCase() === emailLower);
+    if (!matched) {
+      return true; // Default to allowing if they are some other unknown system user or google user
+    }
+    
+    // Check custom list of allowed tabs
+    if (!matched.allowedTabs) {
+      return true; // Default to allow so we don't lock existing users out
+    }
+    
+    return matched.allowedTabs.includes(tabId);
+  };
+
+  // Redirect users if they are currently on a disallowed tab
+  useEffect(() => {
+    if (currentUser && !isTabAllowed(activeTab)) {
+      const tabs = ["manifest", "search", "add", "flights", "settings"];
+      const firstAllowed = tabs.find(t => isTabAllowed(t));
+      if (firstAllowed) {
+        setActiveTab(firstAllowed as any);
+      }
+    }
+  }, [currentUser, activeTab, workUsers]);
+
+  const toggleUserTabAccess = async (userAccount: any, tabId: string) => {
+    if (!isUserAdminCurrent()) {
+      alert("Unauthorized: Only administrator accounts can modify tab access permissions.");
+      return;
+    }
+
+    const currentAllowed = userAccount.allowedTabs || ["manifest", "search", "add", "flights", "settings"];
+    let newAllowed: string[];
+    if (currentAllowed.includes(tabId)) {
+      newAllowed = currentAllowed.filter((t: string) => t !== tabId);
+    } else {
+      newAllowed = [...currentAllowed, tabId];
+    }
+
+    if (offlineMode) {
+      const updatedWorkUsers = workUsers.map(u => {
+        if (u.id === userAccount.id) {
+          return { ...u, allowedTabs: newAllowed };
+        }
+        return u;
+      });
+      setWorkUsers(updatedWorkUsers);
+      localStorage.setItem("fallback_work_users", JSON.stringify(updatedWorkUsers));
+      return;
+    }
+
+    try {
+      const safeDocId = userAccount.email.replace(/[@.]/g, "_");
+      const userRef = doc(db, "work_users", safeDocId);
+      await setDoc(userRef, { allowedTabs: newAllowed }, { merge: true });
+    } catch (err: any) {
+      console.error("Error toggling tab access: ", err);
+      alert("Failed to update tab permissions: " + err.message);
+    }
+  };
+
+  const handleEditAccountClick = (userAccount: any) => {
+    if (!isUserAdminCurrent()) {
+      alert("Unauthorized: Only administrator accounts can edit workstation profiles.");
+      return;
+    }
+    setSettingsSubTab("setup");
+    setEditingAccount(userAccount);
+    setAdminAddName(userAccount.displayName || "");
+    setAdminAddEmail(userAccount.email || "");
+    setAdminAddPasscode(userAccount.passcode || "");
+    setAdminAddStation(userAccount.station || "MEL");
+    setAdminAddRole(userAccount.role || "Standard user");
+    setAdminAddError("");
+    setAdminAddSuccess("");
+  };
+
+  const handleCancelEditAccount = () => {
+    setEditingAccount(null);
+    setAdminAddName("");
+    setAdminAddEmail("");
+    setAdminAddPasscode("1234");
+    setAdminAddStation("MEL");
+    setAdminAddRole("Standard user");
+    setAdminAddError("");
+    setAdminAddSuccess("");
+  };
+
+  const handleUpdateAdminUser = async () => {
+    if (!isUserAdminCurrent()) {
+      setAdminAddError("Unauthorized: Only administrator accounts can update users.");
+      return;
+    }
+    if (!editingAccount) return;
+    const rawEmail = adminAddEmail.trim().toLowerCase();
+    const rawPasscode = adminAddPasscode.trim();
+    const rawName = adminAddName.trim();
+
+    if (!rawEmail) {
+      setAdminAddError("Email Address is required.");
+      return;
+    }
+    if (!rawPasscode || rawPasscode.length < 4) {
+      setAdminAddError("Password must be at least 4 characters.");
+      return;
+    }
+    if (!rawName) {
+      setAdminAddError("Staff name is required.");
+      return;
+    }
+
+    setIsSubmittingAdminUser(true);
+    setAdminAddError("");
+    setAdminAddSuccess("");
+
+    try {
+      const safeDocId = rawEmail.replace(/[@.]/g, "_");
+      const updateData = {
+        displayName: rawName,
+        email: rawEmail,
+        passcode: rawPasscode,
+        station: adminAddStation.trim() || "MEL",
+        role: adminAddRole || "Standard user",
+        updatedAt: new Date().toISOString(),
+      };
+
+      const updatedLocalUsers = workUsers.map(u => 
+        u.email.toLowerCase() === rawEmail ? { ...u, ...updateData } : u
+      );
+      setWorkUsers(updatedLocalUsers);
+      localStorage.setItem("fallback_work_users", JSON.stringify(updatedLocalUsers));
+
+      if (!offlineMode) {
+        const userRef = doc(db, "work_users", safeDocId);
+        await setDoc(userRef, updateData, { merge: true });
+      }
+
+      // If updating ourselves, also sync current workstation role/station context
+      if (currentUser && currentUser.email.toLowerCase() === rawEmail) {
+        localStorage.setItem("seaway_guest_name", rawName);
+        localStorage.setItem("seaway_guest_role", adminAddRole);
+        localStorage.setItem("seaway_guest_station", adminAddStation);
+        setGuestUser(prev => prev ? { ...prev, displayName: rawName, role: adminAddRole, station: adminAddStation } : null);
+      }
+
+      setAdminAddSuccess(`Successfully updated "${rawName}" account!`);
+      handleCancelEditAccount();
+    } catch (err: any) {
+      console.error("Admin user update error:", err);
+      setAdminAddError("Failed to update user: " + err.message);
+    } finally {
+      setIsSubmittingAdminUser(false);
+    }
+  };
+
+  const initiatePasswordReset = (userAccount: any) => {
+    setPasswordResetTarget(userAccount);
+    setNewPasswordValue(userAccount.passcode || "");
+  };
+
+  const handleCommitPasswordChange = async (targetUser: any, newPass: string) => {
+    const cleanPass = newPass.trim();
+    if (cleanPass.length < 4) {
+      alert("Password must be at least 4 characters.");
+      return;
+    }
+    const currentEmail = currentUser?.email?.toLowerCase();
+    const targetEmail = targetUser.email.toLowerCase();
+    const isAdmin = isUserAdminCurrent();
+    const isSelf = currentEmail === targetEmail;
+
+    if (!isAdmin && !isSelf) {
+      alert("Unauthorized: You do not have permissions to reset this password.");
+      return;
+    }
+
+    try {
+      const safeDocId = targetUser.email.replace(/[@.]/g, "_");
+      
+      const updatedLocalUsers = workUsers.map(u => 
+        u.email.toLowerCase() === targetEmail ? { ...u, passcode: cleanPass } : u
+      );
+      setWorkUsers(updatedLocalUsers);
+      localStorage.setItem("fallback_work_users", JSON.stringify(updatedLocalUsers));
+
+      if (!offlineMode) {
+        const userRef = doc(db, "work_users", safeDocId);
+        await setDoc(userRef, { passcode: cleanPass }, { merge: true });
+      }
+      
+      // Update guestUser states locally
+      if (guestUser && guestUser.email.toLowerCase() === targetEmail) {
+        setGuestUser(prev => prev ? { ...prev, passcode: cleanPass } : null);
+      }
+      
+      alert(`Success: Password for "${targetUser.displayName || targetUser.name || 'Account'}" has been updated to "${cleanPass}" successfully!`);
+      setPasswordResetTarget(null);
+      setNewPasswordValue("");
+    } catch (err: any) {
+      alert(`Error updating password: ${err.message}`);
+    }
+  };
+
   // Helper to remove any work user from the passcode ledger
   const handleDeleteWorkUser = async (emailKey: string) => {
+    if (!isUserAdminCurrent()) {
+      alert("Unauthorized: Only administrator accounts can delete users.");
+      return;
+    }
+    const confirmDelete = window.confirm("Are you sure you want to delete this administration account?");
+    if (!confirmDelete) return;
     try {
-      await deleteDoc(doc(db, "work_users", emailKey));
+      const updatedLocalUsers = workUsers.filter(u => u.id !== emailKey);
+      setWorkUsers(updatedLocalUsers);
+      localStorage.setItem("fallback_work_users", JSON.stringify(updatedLocalUsers));
+
+      if (!offlineMode) {
+        await deleteDoc(doc(db, "work_users", emailKey));
+      }
     } catch (err: any) {
       console.error("Delete coworker error:", err);
       handleFirestoreError(err, OperationType.DELETE, `work_users/${emailKey}`);
@@ -594,6 +1161,9 @@ export default function App() {
         id: editingShipment.id,
         ownerId: editingShipment.ownerId || currentUser.uid,
         workspaceId: sWorkspaceId,
+        station: editingShipment.station || selectedPort,
+        confirmDelete: false,
+        deleteSured: false,
       };
       updatedRecords = updatedRecords.map(r => r.id === editingShipment.id ? newRec : r);
       setEditingShipment(null);
@@ -605,6 +1175,7 @@ export default function App() {
         complete: false,
         ownerId: currentUser.uid,
         workspaceId: workspaceId,
+        station: selectedPort,
       };
       updatedRecords = [newRec, ...updatedRecords];
     }
@@ -628,16 +1199,21 @@ export default function App() {
   const handleDeleteShipment = async (id: number) => {
     if (!currentUser) return;
     
+    const numericId = Number(id);
+    recentlyDeletedIds.current.add(numericId);
+    
+    const matched = records.find((r) => Number(r.id) === numericId);
+    if (!matched) return;
+    
     // Optimistic local state update
-    const updatedRecords = records.filter((r) => r.id !== id);
+    const updatedRecords = records.filter((r) => Number(r.id) !== numericId);
     setRecords(updatedRecords);
     localStorage.setItem(`fallback_shipments_${workspaceId}`, JSON.stringify(updatedRecords));
 
     if (!offlineMode) {
       try {
-        const matched = records.find((r) => r.id === id);
-        const sWorkspaceId = matched?.workspaceId || workspaceId;
-        const docId = `${sWorkspaceId}_${id}`;
+        const sWorkspaceId = matched.workspaceId || workspaceId;
+        const docId = `${sWorkspaceId}_${numericId}`;
         await deleteDoc(doc(db, "shipments", docId));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, "shipments");
@@ -653,6 +1229,26 @@ export default function App() {
     setRecords(updatedRecords);
     localStorage.setItem(`fallback_shipments_${workspaceId}`, JSON.stringify(updatedRecords));
 
+    // Synchronize to local loadsheet storage if operator field is updated
+    if (fields.operator !== undefined) {
+      try {
+        const storedKey = `loadsheet_autosave_v2_${id}`;
+        const saved = localStorage.getItem(storedKey);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (parsed && parsed.ls) {
+            parsed.ls.operator = fields.operator;
+            if (parsed.ccsMeta) {
+              parsed.ccsMeta.operator = fields.operator;
+            }
+            localStorage.setItem(storedKey, JSON.stringify(parsed));
+          }
+        }
+      } catch (err) {
+        console.error("Local loadsheet operator sync failed:", err);
+      }
+    }
+
     if (!offlineMode) {
       try {
         const matched = records.find((r) => r.id === id);
@@ -665,6 +1261,31 @@ export default function App() {
             ownerId: matched.ownerId || currentUser.uid,
             workspaceId: sWorkspaceId,
           });
+
+          // Synchronize to Firestore loadsheets collection if operator field is updated
+          if (fields.operator !== undefined) {
+            const parentWorkspaceId = matched.workspaceId || matched.ownerId || currentUser.uid;
+            const lsDocRef = doc(db, "loadsheets", `${parentWorkspaceId}_${id}`);
+            const lsSnap = await getDoc(lsDocRef);
+            if (lsSnap.exists()) {
+              const lsData = lsSnap.data();
+              let changed = false;
+              if (lsData.ls && lsData.ls.operator !== fields.operator) {
+                lsData.ls.operator = fields.operator;
+                changed = true;
+              }
+              if (lsData.ccsMeta && lsData.ccsMeta.operator !== fields.operator) {
+                lsData.ccsMeta.operator = fields.operator;
+                changed = true;
+              }
+              if (changed) {
+                await setDoc(lsDocRef, {
+                  ...lsData,
+                  updatedAt: new Date().toISOString(),
+                });
+              }
+            }
+          }
         }
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, "shipments");
@@ -716,6 +1337,7 @@ export default function App() {
         complete: false,
         ownerId: currentUser.uid,
         workspaceId: workspaceId,
+        station: selectedPort,
       };
     });
     
@@ -746,8 +1368,9 @@ export default function App() {
         if (workspaceId === currentUser.uid) {
           setRecords(SEED_DATA);
           localStorage.setItem(`fallback_shipments_${workspaceId}`, JSON.stringify(SEED_DATA));
-          setSchedule(DEFAULT_SCHEDULE);
-          localStorage.setItem(`fallback_schedules_${workspaceId}`, JSON.stringify(DEFAULT_SCHEDULE));
+          const initialSched = selectedPort === "MEL" ? DEFAULT_SCHEDULE : {};
+          setSchedule(initialSched);
+          localStorage.setItem(`fallback_schedules_${workspaceId}_${selectedPort}`, JSON.stringify(initialSched));
         } else {
           setRecords([]);
           localStorage.setItem(`fallback_shipments_${workspaceId}`, JSON.stringify([]));
@@ -767,9 +1390,9 @@ export default function App() {
 
           // Reseed ONLY if it is the Personal Workspace
           if (workspaceId === currentUser.uid) {
-            // Clean out custom schedules from Firestore
+            // Clean out custom schedules from Firestore for the active port
             const deleteSchedules = Object.keys(schedule).map(async (f) => {
-              const docId = `${currentUser.uid}_${f}`;
+              const docId = `${currentUser.uid}_${selectedPort}_${f}`;
               await deleteDoc(doc(db, "schedules", docId));
             });
             await Promise.all(deleteSchedules);
@@ -787,13 +1410,16 @@ export default function App() {
 
   const handleScheduleChange = async (updatedSec: FlightSchedule) => {
     setSchedule(updatedSec);
-    localStorage.setItem(`fallback_schedules_${workspaceId}`, JSON.stringify(updatedSec));
+    localStorage.setItem(`fallback_schedules_${workspaceId}_${selectedPort}`, JSON.stringify(updatedSec));
     
     if (!currentUser) return;
     if (!offlineMode) {
       try {
+        const batch = writeBatch(db);
+        let hasOperations = false;
+
         for (const [flight, info] of Object.entries(updatedSec)) {
-          const def = DEFAULT_SCHEDULE[flight];
+          const def = selectedPort === "MEL" ? DEFAULT_SCHEDULE[flight] : undefined;
           if (
             !def ||
             def.cutoff !== info.cutoff ||
@@ -802,10 +1428,14 @@ export default function App() {
             def.etd !== info.etd ||
             def.eta !== info.eta ||
             def.airline !== info.airline ||
-            def.days !== info.days
+            def.days !== info.days ||
+            def.emailContacts !== info.emailContacts ||
+            def.contactPhone !== info.contactPhone ||
+            def.bookingPortal !== info.bookingPortal ||
+            def.bookingNotes !== info.bookingNotes
           ) {
-            const docId = `${workspaceId}_${flight}`;
-            await setDoc(doc(db, "schedules", docId), {
+            const docId = `${workspaceId}_${selectedPort}_${flight}`;
+            batch.set(doc(db, "schedules", docId), {
               flightCode: flight,
               cutoff: info.cutoff || "",
               dest: info.dest || "",
@@ -814,18 +1444,41 @@ export default function App() {
               eta: info.eta || "",
               airline: info.airline || "",
               days: info.days || "",
+              emailContacts: info.emailContacts || "",
+              contactPhone: info.contactPhone || "",
+              bookingPortal: info.bookingPortal || "",
+              bookingNotes: info.bookingNotes || "",
               ownerId: currentUser.uid,
               workspaceId: workspaceId,
+              station: selectedPort,
               updatedAt: new Date().toISOString(),
             });
+            hasOperations = true;
           }
         }
 
         for (const flight of Object.keys(schedule)) {
           if (!updatedSec[flight]) {
-            const docId = `${workspaceId}_${flight}`;
-            await deleteDoc(doc(db, "schedules", docId));
+            const docId = `${workspaceId}_${selectedPort}_${flight}`;
+            const isDefault = selectedPort === "MEL" && DEFAULT_SCHEDULE[flight];
+            if (isDefault) {
+              batch.set(doc(db, "schedules", docId), {
+                flightCode: flight,
+                isDeleted: true,
+                ownerId: currentUser.uid,
+                workspaceId: workspaceId,
+                station: selectedPort,
+                updatedAt: new Date().toISOString(),
+              });
+            } else {
+              batch.delete(doc(db, "schedules", docId));
+            }
+            hasOperations = true;
           }
+        }
+
+        if (hasOperations) {
+          await batch.commit();
         }
       } catch (error) {
         console.error("Error updating flight mapping inside Firestore: ", error);
@@ -843,8 +1496,11 @@ export default function App() {
   const [searchQ, setSearchQ] = useState("");
   const [searchSelectedIds, setSearchSelectedIds] = useState<Set<number>>(new Set());
 
+  // FILTER RECORDS BY SELECTED PORT so they are independent of each port's manifest!
+  const portRecords = records.filter(r => (r.station || "MEL") === selectedPort);
+
   // Stat computations for dashboard widget (PER DAY matching selected date!)
-  const dayRecordsForStats = records.filter((r) => r.date === selectedDate);
+  const dayRecordsForStats = portRecords.filter((r) => r.date === selectedDate);
   const totalLoadsCount = dayRecordsForStats.length;
   const pendingCount = dayRecordsForStats.filter((r) => !r.complete).length;
   const aqisCount = dayRecordsForStats.filter(
@@ -898,31 +1554,23 @@ export default function App() {
           position: "relative",
         }}
       >
-        {(dbError || !offlineMode) && (
+        {quotaExceeded ? (
+          <div style={{ position: "absolute", top: 0, left: 0, right: 0, background: "#fef2f2", color: "#991b1b", borderBottom: "1px solid #fca5a5", padding: "12px 24px", fontSize: "12.5px", display: "flex", justifyContent: "space-between", alignItems: "center", zIndex: 100, boxSizing: "border-box", gap: "10px" }}>
+            <span style={{ fontSize: "12px", textAlign: "left" }}>
+              ⚠️ <strong>Cloud Quota Limit Exceeded (Spark Free Tier):</strong> Google Firebase Firestore's free-tier write limit has been reached for today. 
+              We have automatically activated <strong>Offline Safeguard Mode</strong>. All cargo inputs, load sheets, and flight mapping records 
+              are being saved securely to your local browser storage, allowing you to continue using all features without interruption!
+            </span>
+            <button onClick={() => setQuotaExceeded(false)} style={{ background: "transparent", border: "none", color: "#991b1b", fontWeight: "bold", cursor: "pointer", fontSize: "14px" }}>✕</button>
+          </div>
+        ) : dbError ? (
           <div style={{ position: "absolute", top: 0, left: 0, right: 0, background: "#fffbeb", color: "#92400e", borderBottom: "1px solid #fde68a", padding: "12px 24px", fontSize: "12.5px", display: "flex", justifyContent: "space-between", alignItems: "center", zIndex: 100, boxSizing: "border-box", gap: "10px" }}>
             <span style={{ fontSize: "12px", textAlign: "left" }}>
-              ⚠️ {dbError ? <span><strong>Cloud Sync issue:</strong> {dbError}</span> : <span>Network restrictions or iframe database limits detected.</span>}
-              {" "}
-              <strong>No worries!</strong> You can bypass this and run 100% locally in Sandbox mode:
+              ⚠️ <span><strong>Cloud Sync issue:</strong> {dbError}</span>
             </span>
-            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-              <button 
-                onClick={() => {
-                  setOfflineMode(true);
-                  localStorage.setItem("seaway_offline_mode", "true");
-                  setDbError("");
-                  // Log in immediately as Melbourne Export Air (MAP)
-                  const profile = STATION_PROFILES[0];
-                  handleProfileSignIn(profile, "1234", true);
-                }} 
-                style={{ background: "#d97706", border: "none", color: "#ffffff", padding: "6px 12px", borderRadius: "6px", fontWeight: "bold", cursor: "pointer", fontSize: "11px" }}
-              >
-                📴 Activate Local Sandbox Mode
-              </button>
-              <button onClick={() => setDbError("")} style={{ background: "transparent", border: "none", color: "#92400e", fontWeight: "bold", cursor: "pointer", fontSize: "14px" }}>✕</button>
-            </div>
+            <button onClick={() => setDbError("")} style={{ background: "transparent", border: "none", color: "#92400e", fontWeight: "bold", cursor: "pointer", fontSize: "14px" }}>✕</button>
           </div>
-        )}
+        ) : null}
         <div
           style={{
             maxWidth: "480px",
@@ -949,350 +1597,197 @@ export default function App() {
             </div>
           </div>
 
-          {!selectedProfile ? (
-            <div>
-              <p style={{ fontSize: "13.5px", color: "#64748b", lineHeight: 1.5, marginBottom: "24px" }}>
-                Select your designated station profile to access the cargo manifest and load sheet ledger.
+          {isResettingPassword ? (
+            <form onSubmit={handlePasswordResetSubmit} style={{ textAlign: "left", display: "flex", flexDirection: "column", gap: "14px" }}>
+              <h3 style={{ fontSize: "15px", fontWeight: 800, color: "#1e293b", margin: "0 0 4px 0", textAlign: "center" }}>Reset Workstation Password</h3>
+              <p style={{ fontSize: "12px", color: "#64748b", margin: "0 0 12px 0", textAlign: "center", lineHeight: "1.4" }}>
+                Verify your registered account details below to set a new workstation password.
               </p>
-              
-              <div style={{ display: "flex", flexDirection: "column", gap: "10px", textAlign: "left" }}>
-                {getCombinedProfiles().map((profile) => (
-                  <button
-                    key={profile.email}
-                    onClick={() => {
-                      setSelectedProfile(profile);
-                      setPinInput("");
-                      setPinError("");
-                    }}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "14px",
-                      padding: "16px",
-                      background: "#ffffff",
-                      border: "1px solid #cbd5e1",
-                      borderRadius: "16px",
-                      cursor: "pointer",
-                      textAlign: "left",
-                      width: "100%",
-                      transition: "all 0.15s ease",
-                    }}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.background = "#f8fafc";
-                      e.currentTarget.style.borderColor = profile.color;
-                      e.currentTarget.style.boxShadow = "0 4px 12px rgba(15, 23, 42, 0.03)";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.background = "#ffffff";
-                      e.currentTarget.style.borderColor = "#cbd5e1";
-                      e.currentTarget.style.boxShadow = "none";
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: "44px",
-                        height: "44px",
-                        borderRadius: "50%",
-                        background: profile.color,
-                        color: "#ffffff",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        fontWeight: 800,
-                        fontSize: "13px",
-                        letterSpacing: "0.5px",
-                        flexShrink: 0,
-                      }}
-                    >
-                      {profile.initials}
-                    </div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontWeight: 750, fontSize: "14px", color: "#1e293b", marginBottom: "2px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {profile.name}
-                      </div>
-                      <div style={{ fontSize: "11px", color: "#64748b", fontFamily: "monospace" }}>
-                        {profile.email}
-                      </div>
-                    </div>
-                    <div style={{ background: "#f1f5f9", padding: "4px 8px", borderRadius: "8px", fontSize: "10px", fontWeight: 700, color: "#475569", flexShrink: 0 }}>
-                      PIN Guard
-                    </div>
-                  </button>
-                ))}
+
+              <div>
+                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "4px" }}>Registered Email Address:</label>
+                <input
+                  type="email"
+                  placeholder="e.g. employee@seaway.com.au"
+                  value={resetEmail}
+                  onChange={(e) => setResetEmail(e.target.value)}
+                  style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "10px", outline: "none", boxSizing: "border-box" }}
+                />
               </div>
-            </div>
+
+              <div>
+                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "4px" }}>Verification Staff Name:</label>
+                <input
+                  type="text"
+                  placeholder="Exact registered full name"
+                  value={resetName}
+                  onChange={(e) => setResetName(e.target.value)}
+                  style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "10px", outline: "none", boxSizing: "border-box" }}
+                />
+              </div>
+
+              <div>
+                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "4px" }}>IATA:</label>
+                <select
+                  value={resetStation}
+                  onChange={(e) => setResetStation(e.target.value)}
+                  style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "10px", outline: "none", boxSizing: "border-box", background: "#ffffff" }}
+                >
+                  {ALL_STATIONS.map((st) => (
+                    <option key={st.value} value={st.value}>{st.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "4px" }}>Choose New Password:</label>
+                <input
+                  type="text"
+                  placeholder="Enter secure new password"
+                  value={resetNewPassword}
+                  onChange={(e) => setResetNewPassword(e.target.value)}
+                  style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "10px", outline: "none", boxSizing: "border-box", fontWeight: "bold", color: "#0284c7" }}
+                />
+              </div>
+
+              {resetError && (
+                <div style={{ padding: "10px 12px", background: "#fef2f2", border: "1px solid #fee2e2", borderRadius: "10px", color: "#ef4444", fontSize: "12px", fontWeight: 600 }}>
+                  {resetError}
+                </div>
+              )}
+
+              {resetSuccess && (
+                <div style={{ padding: "10px 12px", background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: "10px", color: "#16a34a", fontSize: "12px", fontWeight: 600 }}>
+                  {resetSuccess}
+                </div>
+              )}
+
+              <div style={{ display: "flex", gap: "10px", marginTop: "6px" }}>
+                <button
+                  type="submit"
+                  disabled={isSubmittingReset}
+                  style={{
+                    flex: 1,
+                    padding: "11px",
+                    background: "#16a34a",
+                    color: "#ffffff",
+                    border: "none",
+                    borderRadius: "10px",
+                    fontSize: "13px",
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    transition: "all 0.15s ease",
+                    opacity: isSubmittingReset ? 0.7 : 1
+                  }}
+                >
+                  {isSubmittingReset ? "Verifying..." : "Reset Password"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsResettingPassword(false);
+                    setPinError("");
+                    setResetError("");
+                    setResetSuccess("");
+                  }}
+                  style={{
+                    background: "#f1f5f9",
+                    border: "1px solid #cbd5e1",
+                    color: "#475569",
+                    padding: "11px 16px",
+                    borderRadius: "10px",
+                    fontSize: "13px",
+                    fontWeight: 700,
+                    cursor: "pointer"
+                  }}
+                >
+                  Back to Login
+                </button>
+              </div>
+            </form>
           ) : (
-            <div
-              style={{ cursor: "text" }}
-              onClick={() => {
-                const el = document.getElementById("pin-keyboard-input");
-                if (el) el.focus();
-              }}
-            >
-              {/* Visible numeric/keyboard proxy input */}
-              <input
-                id="pin-keyboard-input"
-                type="text"
-                pattern="[0-9]*"
-                inputMode="numeric"
-                maxLength={4}
-                value={pinInput}
-                onChange={(e) => {
-                  const cleaned = e.target.value.replace(/[^0-9]/g, "").slice(0, 4);
-                  setPinInput(cleaned);
-                  setPinError("");
-                  if (cleaned.length === 4) {
-                    setTimeout(() => {
-                      handleProfileSignIn(selectedProfile, cleaned);
-                    }, 180);
-                  }
-                }}
-                autoFocus
-                style={{
-                  position: "absolute",
-                  opacity: 0,
-                  width: "1px",
-                  height: "1px",
-                  pointerEvents: "none",
-                  zIndex: -1,
-                }}
-              />
-
-              {/* Back button */}
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setSelectedProfile(null);
-                  setPinInput("");
-                  setPinError("");
-                }}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: "#64748b",
-                  fontSize: "12px",
-                  fontWeight: 700,
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  marginBottom: "20px",
-                }}
-                onMouseEnter={(e) => e.currentTarget.style.color = "#0284c7"}
-                onMouseLeave={(e) => e.currentTarget.style.color = "#64748b"}
-              >
-                ← Back to Profiles
-              </button>
-
-              <div
-                style={{
-                  display: "inline-flex",
-                  width: "56px",
-                  height: "56px",
-                  borderRadius: "50%",
-                  background: selectedProfile.color,
-                  color: "#ffffff",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  fontWeight: 800,
-                  fontSize: "16px",
-                  marginBottom: "12px",
-                }}
-              >
-                {selectedProfile.initials}
-              </div>
-
-              <h2 style={{ fontSize: "16px", fontWeight: 800, color: "#1e293b", margin: "0 0 4px 0" }}>
-                {selectedProfile.name}
-              </h2>
-              <p style={{ fontSize: "12.5px", color: "#64748b", margin: "0 0 24px 0", fontFamily: "monospace" }}>
-                {selectedProfile.email}
+            <form onSubmit={handleLoginSubmit} style={{ textAlign: "left", display: "flex", flexDirection: "column", gap: "16px" }}>
+              <p style={{ fontSize: "13px", color: "#64748b", lineHeight: 1.5, marginBottom: "8px", textAlign: "center" }}>
+                Provide your workstation ID details to access the cargo manifests and load sheets.
               </p>
 
-              {pinError ? (
-                <div style={{ color: "#ef4444", fontSize: "12px", fontWeight: 700, marginBottom: "16px" }}>
+              <div>
+                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>User name or Email:</label>
+                <input
+                  type="text"
+                  placeholder="e.g. melexpair@seaway.com.au or Staff Name"
+                  value={loginUsername}
+                  onChange={(e) => setLoginUsername(e.target.value)}
+                  style={{ width: "100%", padding: "11px 14px", fontSize: "13.5px", border: "1px solid #cbd5e1", borderRadius: "12px", outline: "none", boxSizing: "border-box" }}
+                />
+              </div>
+
+              <div>
+                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>Password:</label>
+                <input
+                  type="password"
+                  placeholder="Enter Password"
+                  value={loginPassword}
+                  onChange={(e) => setLoginPassword(e.target.value)}
+                  style={{ width: "100%", padding: "11px 14px", fontSize: "13.5px", border: "1px solid #cbd5e1", borderRadius: "12px", outline: "none", boxSizing: "border-box" }}
+                />
+              </div>
+
+              <div>
+                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>IATA:</label>
+                <select
+                  value={loginStation}
+                  onChange={(e) => setLoginStation(e.target.value)}
+                  style={{ width: "100%", padding: "11px 14px", fontSize: "13.5px", border: "1px solid #cbd5e1", borderRadius: "12px", outline: "none", boxSizing: "border-box", background: "#ffffff", color: "#1e293b", cursor: "pointer" }}
+                >
+                  {ALL_STATIONS.map((st) => (
+                    <option key={st.value} value={st.value}>{st.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              {pinError && (
+                <div style={{ padding: "10px 12px", background: "#fef2f2", border: "1px solid #fee2e2", borderRadius: "10px", color: "#ef4444", fontSize: "12.5px", fontWeight: 600 }}>
                   {pinError}
                 </div>
-              ) : (
-                <p style={{ fontSize: "12.5px", color: "#64748b", margin: "0 0 16px 0" }}>
-                  Enter your 4-digit Security PIN to sign in.
-                </p>
               )}
 
-              {/* PIN Indicator Dots */}
-              <div style={{ display: "flex", gap: "16px", justifyContent: "center", margin: "0 0 16px 0" }}>
-                {[0, 1, 2, 3].map((idx) => (
-                  <div
-                    key={idx}
-                    style={{
-                      width: "16px",
-                      height: "16px",
-                      borderRadius: "50%",
-                      border: `2px solid ${pinError ? "#ef4444" : "#cbd5e1"}`,
-                      background: pinInput.length > idx ? (pinError ? "#ef4444" : "#1e293b") : "transparent",
-                      transition: "all 0.12s ease",
-                      transform: pinInput.length === idx ? "scale(1.15)" : "scale(1)",
-                    }}
-                  />
-                ))}
-              </div>
-
-              {/* Helper keyboard hint */}
-              <div style={{ fontSize: "11px", color: "#94a3b8", display: "flex", alignItems: "center", justifyContent: "center", gap: "4px", marginBottom: "24px" }}>
-                <span>⌨️</span> Type with your keyboard or dial below
-              </div>
-
-              {/* Custom High-Fidelity Numpad */}
-              <div
+              <button
+                type="submit"
+                disabled={submittingAuth}
                 style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(3, 1fr)",
-                  gap: "14px 20px",
-                  justifyItems: "center",
-                  maxWidth: "280px",
-                  margin: "0 auto",
+                  width: "100%",
+                  padding: "13px",
+                  background: "#0284c7",
+                  color: "#ffffff",
+                  border: "none",
+                  borderRadius: "12px",
+                  fontSize: "14px",
+                  fontWeight: 700,
+                  cursor: "pointer",
+                  transition: "all 0.15s ease",
+                  opacity: submittingAuth ? 0.7 : 1,
+                  marginTop: "6px"
                 }}
               >
-                {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((num) => (
-                  <button
-                    key={num}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (pinInput.length < 4) {
-                        const next = pinInput + num;
-                        setPinInput(next);
-                        setPinError("");
-                        if (next.length === 4) {
-                          setTimeout(() => {
-                            handleProfileSignIn(selectedProfile, next);
-                          }, 180);
-                        }
-                      }
-                    }}
-                    style={{
-                      width: "56px",
-                      height: "56px",
-                      borderRadius: "50%",
-                      border: "1px solid #cbd5e1",
-                      background: "#ffffff",
-                      fontSize: "18px",
-                      fontWeight: "700",
-                      color: "#1e293b",
-                      cursor: "pointer",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
-                      transition: "all 0.1s ease",
-                    }}
-                    onMouseEnter={(e) => { e.currentTarget.style.background = "#f1f5f9"; e.currentTarget.style.borderColor = "#94a3b8"; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.background = "#ffffff"; e.currentTarget.style.borderColor = "#cbd5e1"; }}
-                  >
-                    {num}
-                  </button>
-                ))}
-                
-                {/* Clear Button */}
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setPinInput("");
-                    setPinError("");
-                  }}
-                  style={{
-                    width: "56px",
-                    height: "56px",
-                    borderRadius: "50%",
-                    border: "none",
-                    background: "transparent",
-                    fontSize: "13px",
-                    fontWeight: "700",
-                    color: "#94a3b8",
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    transition: "all 0.1s ease",
-                  }}
-                  onMouseEnter={(e) => e.currentTarget.style.color = "#ef4444"}
-                  onMouseLeave={(e) => e.currentTarget.style.color = "#94a3b8"}
-                >
-                  Clear
-                </button>
+                {submittingAuth ? "Authorizing access..." : "Sign In to Workstation"}
+              </button>
 
-                {/* Number 0 */}
+              <div style={{ textAlign: "center", marginTop: "8px" }}>
                 <button
-                  key="0"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (pinInput.length < 4) {
-                      const next = pinInput + "0";
-                      setPinInput(next);
-                      setPinError("");
-                      if (next.length === 4) {
-                        setTimeout(() => {
-                          handleProfileSignIn(selectedProfile, next);
-                        }, 180);
-                      }
-                    }
-                  }}
-                  style={{
-                    width: "56px",
-                    height: "56px",
-                    borderRadius: "50%",
-                    border: "1px solid #cbd5e1",
-                    background: "#ffffff",
-                    fontSize: "18px",
-                    fontWeight: "700",
-                    color: "#1e293b",
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
-                    transition: "all 0.1s ease",
-                  }}
-                  onMouseEnter={(e) => { e.currentTarget.style.background = "#f1f5f9"; e.currentTarget.style.borderColor = "#94a3b8"; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.background = "#ffffff"; e.currentTarget.style.borderColor = "#cbd5e1"; }}
-                >
-                  0
-                </button>
-
-                {/* Backspace Button */}
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setPinInput(pinInput.slice(0, -1));
+                  type="button"
+                  onClick={() => {
+                    setIsResettingPassword(true);
                     setPinError("");
+                    setResetError("");
+                    setResetSuccess("");
                   }}
-                  style={{
-                    width: "56px",
-                    height: "56px",
-                    borderRadius: "50%",
-                    border: "none",
-                    background: "transparent",
-                    fontSize: "18px",
-                    fontWeight: "700",
-                    color: "#94a3b8",
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    transition: "all 0.1s ease",
-                  }}
-                  onMouseEnter={(e) => e.currentTarget.style.color = "#1e293b"}
-                  onMouseLeave={(e) => e.currentTarget.style.color = "#94a3b8"}
+                  style={{ background: "transparent", border: "none", color: "#0284c7", fontSize: "12.5px", fontWeight: 700, cursor: "pointer", textDecoration: "underline" }}
                 >
-                  ⌫
+                  Forgot Password? Reset password
                 </button>
               </div>
-
-              {submittingAuth && (
-                <p style={{ marginTop: "16px", fontSize: "12px", color: "#0284c7", fontWeight: 700, animation: "pulse 1.5s infinite" }}>
-                  Authorizing station access...
-                </p>
-              )}
-            </div>
+            </form>
           )}
 
           {/* Diagnostics Cache and Parameter Eraser */}
@@ -1325,7 +1820,6 @@ export default function App() {
               🛠️ Registering Issues? Clear Cache & Reset Station
             </button>
           </div>
-
         </div>
       </div>
     );
@@ -1334,35 +1828,36 @@ export default function App() {
   return (
     <div
       style={{
-        background: "#f8fafc", // A gorgeous, ultra-sleek light steel background
+        background: "#f8fafc",
         height: "100vh",
         display: "flex",
         flexDirection: "column",
         fontFamily: "'Inter', system-ui, -apple-system, sans-serif",
-        color: "#1e293b", // Premium slate gray
+        color: "#1e293b",
         overflow: "hidden",
         fontSize: "13px",
       }}
     >
-      {dbError && !offlineMode && (
-        <div style={{ background: "#fffbeb", color: "#92400e", borderBottom: "1px solid #fde68a", padding: "10px 24px", fontSize: "12px", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0, zIndex: 999, gap: "12px" }}>
-          <span>⚠️ <strong>Cloud Database connection issue:</strong> {dbError}. Save locally instead to preserve work:</span>
-          <div style={{ display: "flex", gap: "8px" }}>
-            <button 
-              onClick={() => {
-                setOfflineMode(true);
-                localStorage.setItem("seaway_offline_mode", "true");
-                setDbError("");
-              }} 
-              style={{ background: "#d97706", border: "none", color: "#ffffff", padding: "4px 10px", borderRadius: "6px", fontWeight: "bold", cursor: "pointer", fontSize: "11px" }}
-            >
-              📴 Switch to Local Sandbox Mode
-            </button>
-            <button onClick={() => setDbError("")} style={{ background: "transparent", border: "none", color: "#92400e", fontWeight: "bold", cursor: "pointer", fontSize: "12px" }}>✕</button>
-          </div>
+      {quotaExceeded ? (
+        <div style={{ background: "#fef2f2", color: "#991b1b", borderBottom: "1px solid #fca5a5", padding: "10px 24px", fontSize: "12.5px", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0, zIndex: 1000, gap: "12px" }}>
+          <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <span style={{ fontSize: "16px" }}>⚠️</span>
+            <span>
+              <strong>Cloud Quota Limit Exceeded (Spark Free Tier):</strong> Firebase Firestore's free-tier write limit has been reached for today. 
+              We have automatically activated <strong>Offline Safeguard Mode</strong>. All cargo inputs, load sheets, and flight mapping records 
+              are being saved securely to your local browser storage, allowing you to continue using all features without interruption!
+            </span>
+          </span>
+          <button onClick={() => setQuotaExceeded(false)} style={{ background: "transparent", border: "none", color: "#991b1b", fontWeight: "bold", cursor: "pointer", fontSize: "14px" }}>✕</button>
         </div>
-      )}
-      {/* Premium Corporate Navbar */}
+      ) : dbError ? (
+        <div style={{ background: "#fffbeb", color: "#92400e", borderBottom: "1px solid #fde68a", padding: "10px 24px", fontSize: "12px", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0, zIndex: 999, gap: "12px" }}>
+          <span>⚠️ <strong>Cloud Database connection issue:</strong> {dbError}</span>
+          <button onClick={() => setDbError("")} style={{ background: "transparent", border: "none", color: "#92400e", fontWeight: "bold", cursor: "pointer", fontSize: "12px" }}>✕</button>
+        </div>
+      ) : null}
+
+      {/* Premium Corporate Top Header */}
       <header
         style={{
           height: "64px",
@@ -1373,345 +1868,231 @@ export default function App() {
           justifyContent: "space-between",
           padding: "0 24px",
           boxShadow: "0 1px 3px rgba(0, 0, 0, 0.02)",
+          flexShrink: 0,
           zIndex: 10,
+          gap: "16px",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-          <div 
-            style={{ 
-              width: "32px", 
-              height: "32px", 
-              borderRadius: "8px", 
-              background: "#f0f9ff",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              border: "1px solid #bae6fd",
-            }}
-          >
-            <Plane style={{ width: "16px", height: "16px", color: "#0284c7" }} />
+        {/* Left Side branding + Port selector + Header Navigation Tabs */}
+        <div style={{ display: "flex", alignItems: "center", gap: "16px", flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexShrink: 0 }}>
+            <div 
+              style={{ 
+                width: "28px", 
+                height: "28px", 
+                borderRadius: "6px", 
+                background: "#f0f9ff",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                border: "1px solid #bae6fd",
+              }}
+            >
+              <Plane style={{ width: "14px", height: "14px", color: "#0284c7" }} />
+            </div>
+            <SeawayLogo height={20} theme="light" />
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-            <SeawayLogo height={22} theme="light" />
-            {offlineMode ? (
-              <div 
-                onClick={() => {
-                  const conf = window.confirm("Do you want to reconnect to the Cloud Database? (If Firestore credentials or connection are inactive, synchronizing may generate warnings)");
-                  if (conf) {
-                    setOfflineMode(false);
-                    localStorage.setItem("seaway_offline_mode", "false");
-                    window.location.reload();
-                  }
-                }}
-                style={{ 
-                  background: "#fef3c7", 
-                  border: "1px solid #fde68a", 
-                  color: "#b45309", 
-                  fontSize: "11px", 
-                  fontWeight: 750, 
-                  padding: "3px 10px", 
-                  borderRadius: "20px", 
-                  display: "flex", 
-                  alignItems: "center", 
-                  gap: "5px", 
-                  cursor: "pointer",
-                  userSelect: "none"
-                }}
-                title="Click to reconnect to Cloud Database"
-              >
-                <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "#b45309" }} />
-                📴 Local Sandbox Active
-              </div>
-            ) : (
-              <div 
-                onClick={() => {
-                  const conf = window.confirm("Switch to 100% Local Sandbox Mode? This bypasses Firestore completely, saving revisions solely in your browser cache to secure offline continuity.");
-                  if (conf) {
-                    setOfflineMode(true);
-                    localStorage.setItem("seaway_offline_mode", "true");
-                  }
-                }}
-                style={{ 
-                  background: "#f0fdf4", 
-                  border: "1px solid #bbf7d0", 
-                  color: "#16a34a", 
-                  fontSize: "11px", 
-                  fontWeight: 750, 
-                  padding: "3px 10px", 
-                  borderRadius: "20px", 
-                  display: "flex", 
-                  alignItems: "center", 
-                  gap: "5px", 
-                  cursor: "pointer",
-                  userSelect: "none"
-                }}
-                title="Click to activate Local Sandbox Mode"
-              >
-                <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "#16a34a" }} />
-                ☁️ Cloud Synchronized
-              </div>
-            )}
+          
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", borderLeft: "1px solid #e2e8f0", paddingLeft: "12px", marginRight: "8px", flexShrink: 0 }}>
+            <span style={{ fontSize: "10.5px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.03em" }}>Port:</span>
+            <select
+              id="active-port-select"
+              value={selectedPort}
+              onChange={(e) => {
+                const port = e.target.value;
+                setSelectedPort(port);
+                localStorage.setItem("seaway_active_port", port);
+              }}
+              disabled={!isUserAdminCurrent()}
+              style={{
+                padding: "3px 22px 3px 8px",
+                fontSize: "11.5px",
+                fontWeight: 700,
+                color: "#0369a1",
+                background: !isUserAdminCurrent() ? "#f1f5f9" : "#f0f9ff",
+                border: "1px solid #bae6fd",
+                borderRadius: "6px",
+                cursor: !isUserAdminCurrent() ? "default" : "pointer",
+                outline: "none",
+                appearance: "none",
+                backgroundImage: `url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%230284c7' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e")`,
+                backgroundRepeat: "no-repeat",
+                backgroundPosition: "right 6px center",
+                backgroundSize: "10px",
+              }}
+              title={!isUserAdminCurrent() ? `Active Hub (Locked to assigned station: ${selectedPort})` : "Switch Active Operational Port Hub"}
+            >
+              {ALL_STATIONS.map((st) => (
+                <option key={st.value} value={st.value}>
+                  {st.value}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Navigation subheadings moved here, in line with logo */}
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", overflowX: "auto", padding: "4px 0", flex: 1, scrollbarWidth: "none" }}>
+            {[
+              { 
+                id: "manifest", 
+                label: "Cargo Manifest List", 
+                icon: <Layers style={{ width: "13px", height: "13px" }} />,
+                badge: totalLoadsCount.toString()
+              },
+              { 
+                id: "search", 
+                label: "Date Range Search", 
+                icon: <Calendar style={{ width: "13px", height: "13px" }} />,
+              },
+              { 
+                id: "add", 
+                label: editingShipment ? "Edit Shipment" : "Plan Shipment", 
+                icon: <PlusCircle style={{ width: "13px", height: "13px" }} />,
+              },
+              { 
+                id: "settings", 
+                label: "Administration", 
+                icon: <Settings2 style={{ width: "13px", height: "13px" }} />,
+              },
+            ].filter((item) => isTabAllowed(item.id)).map((item) => {
+              const isActive = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => {
+                    if (item.id !== "add" && editingShipment) {
+                      setEditingShipment(null);
+                    }
+                    setActiveTab(item.id as any);
+                  }}
+                  style={{
+                    padding: "5px 11px",
+                    borderRadius: "16px",
+                    border: isActive ? "1px solid #bae6fd" : "1px solid #e2e8f0",
+                    background: isActive ? "#f0f9ff" : "#ffffff",
+                    color: isActive ? "#0369a1" : "#475569",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    fontSize: "11px",
+                    fontWeight: isActive ? 750 : 500,
+                    gap: "5px",
+                    transition: "all 0.15s ease",
+                    whiteSpace: "nowrap",
+                    flexShrink: 0,
+                  }}
+                >
+                  <div style={{ color: isActive ? "#0284c7" : "#64748b", display: "flex", alignItems: "center" }}>
+                    {item.icon}
+                  </div>
+                  <span>{item.label}</span>
+                  {item.badge !== undefined && (
+                    <span 
+                      style={{ 
+                        fontSize: "9px", 
+                        fontWeight: 750, 
+                        background: isActive ? "#0284c7" : "#64748b", 
+                        color: "#ffffff", 
+                        padding: "1px 5px", 
+                        borderRadius: "8px" 
+                      }}
+                    >
+                      {item.badge}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
           </div>
         </div>
 
-        {/* Diagnostic KPIs directly in the main header for seamless tracking */}
-        <div style={{ display: "flex", alignItems: "center", gap: "20px" }}>
-          
-          <div style={{ display: "none", alignItems: "center", gap: "20px" }} className="md:flex">
-            <div style={{ textAlign: "right" }}>
-              <div style={{ fontSize: "10px", color: "#64748b", textTransform: "uppercase", fontWeight: 600, letterSpacing: "0.05em" }}>OPERATIONAL STATIONS</div>
-              <div style={{ fontSize: "12px", fontWeight: 700, color: "#0f172a" }}>QFA · SQA · CXA · EK</div>
-            </div>
+        {/* Right side Profile & status indicators & sign out */}
+        <div style={{ display: "flex", alignItems: "center", gap: "12px", flexShrink: 0 }}>
+          {/* Cloud Sync active indicator */}
+          <div style={{ display: "none", alignItems: "center", gap: "4px", color: "#15803d" }} className="md:flex">
+            <Database style={{ width: "11px", height: "11px", color: "#16a34a" }} />
+            <span style={{ fontSize: "10.5px", fontWeight: 700 }}>Cloud Sync</span>
           </div>
 
-          {/* Collaborative Workspace control box */}
-          <div 
-            onClick={() => setShowWorkspaceModal(true)}
-            style={{ 
-              display: "flex", 
-              alignItems: "center", 
-              gap: "8px", 
-              background: workspaceId === currentUser.uid ? "#f8fafc" : "#f0fdf4", 
-              border: workspaceId === currentUser.uid ? "1px solid #cbd5e1" : "1px solid #bbf7d0", 
-              padding: "6px 14px", 
-              borderRadius: "20px", 
-              cursor: "pointer",
-              transition: "all 0.15s ease",
-            }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.borderColor = workspaceId === currentUser.uid ? "#94a3b8" : "#86efac";
-              e.currentTarget.style.background = workspaceId === currentUser.uid ? "#f1f5f9" : "#dcfce7";
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.borderColor = workspaceId === currentUser.uid ? "#cbd5e1" : "#bbf7d0";
-              e.currentTarget.style.background = workspaceId === currentUser.uid ? "#f8fafc" : "#f0fdf4";
-            }}
-            title="Manage Shared Workspaces & Access rooms"
-          >
-            <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: workspaceId === currentUser.uid ? "#64748b" : "#16a34a" }} />
-            <div style={{ display: "flex", flexDirection: "column" }}>
-              <span style={{ fontSize: "9px", color: "#64748b", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.03em", lineHeight: "1.1" }}>Workspace</span>
-              <span style={{ fontSize: "11px", fontWeight: 850, color: workspaceId === currentUser.uid ? "#334155" : "#15803d", lineHeight: "1.2" }}>
-                {workspaceName}
-              </span>
-            </div>
-          </div>
+          <span style={{ fontSize: "9.5px", color: "#b45309", fontWeight: 750, background: "#fef3c7", padding: "2px 6px", borderRadius: "4px" }} className="sm:inline-block">
+            {selectedPort}
+          </span>
 
           {/* Elegant authenticated user info */}
-          <div style={{ display: "flex", alignItems: "center", gap: "12px", borderLeft: "1px solid #e2e8f0", paddingLeft: "20px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
             {(currentUser as any).photoURL ? (
               <img
                 src={(currentUser as any).photoURL}
                 alt={currentUser.displayName || "User"}
                 referrerPolicy="no-referrer"
-                style={{ width: "32px", height: "32px", borderRadius: "50%", border: "2px solid #0284c7" }}
+                style={{ width: "28px", height: "28px", borderRadius: "50%", border: "2px solid #0284c7" }}
               />
             ) : (
-              <div style={{ width: "32px", height: "32px", borderRadius: "50%", background: "#e0f2fe", color: "#0369a1", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: "bold", fontSize: "13px" }}>
+              <div style={{ width: "28px", height: "28px", borderRadius: "50%", background: "#e0f2fe", color: "#0369a1", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: "bold", fontSize: "12px" }}>
                 {(currentUser.displayName || "U")[0].toUpperCase()}
               </div>
             )}
             <div style={{ display: "none", flexDirection: "column" }} className="sm:flex">
-              <span style={{ fontSize: "12px", fontWeight: 700, color: "#0f172a", lineHeight: "1.2" }}>{currentUser.displayName || "Operator"}</span>
-              <span style={{ fontSize: "10px", color: "#64748b" }}>{currentUser.email}</span>
+              <span style={{ fontSize: "11px", fontWeight: 700, color: "#0f172a", lineHeight: "1.2" }}>{currentUser.displayName || "Operator"}</span>
             </div>
-            
-            <button
-              onClick={async () => {
-                if (window.confirm("Are you sure you want to sign out?")) {
-                  if (user) {
-                    await signOut(auth);
-                  }
-                  setGuestUser(null);
-                  localStorage.removeItem("seaway_guest_id");
-                  localStorage.removeItem("seaway_guest_name");
-                  localStorage.removeItem("seaway_guest_email");
-                  // reset workspace id to trigger auto-recalculation
-                  setWorkspaceId("");
-                  setWorkspaceName("Personal Workspace");
-                }
-              }}
-              style={{
-                background: "transparent",
-                border: "none",
-                cursor: "pointer",
-                padding: "6px",
-                borderRadius: "8px",
-                color: "#64748b",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                transition: "all 0.15s",
-              }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.background = "#fee2e2";
-                e.currentTarget.style.color = "#ef4444";
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.background = "transparent";
-                e.currentTarget.style.color = "#64748b";
-              }}
-              title="Sign Out"
-            >
-              <LogOut style={{ width: "16px", height: "16px" }} />
-            </button>
           </div>
+
+          <button
+            onClick={async () => {
+              if (window.confirm("Are you sure you want to sign out?")) {
+                if (user) {
+                  await signOut(auth);
+                }
+                setGuestUser(null);
+                localStorage.removeItem("seaway_guest_id");
+                localStorage.removeItem("seaway_guest_name");
+                localStorage.removeItem("seaway_guest_email");
+                setWorkspaceId("");
+                setWorkspaceName("Personal Workspace");
+              }
+            }}
+            style={{
+              background: "transparent",
+              border: "1px solid #e2e8f0",
+              cursor: "pointer",
+              padding: "5px 10px",
+              borderRadius: "6px",
+              color: "#475569",
+              fontSize: "11px",
+              fontWeight: 500,
+              display: "flex",
+              alignItems: "center",
+              gap: "4px",
+              transition: "all 0.15s",
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = "#fee2e2";
+              e.currentTarget.style.borderColor = "#fecaca";
+              e.currentTarget.style.color = "#ef4444";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "transparent";
+              e.currentTarget.style.borderColor = "#e2e8f0";
+              e.currentTarget.style.color = "#475569";
+            }}
+          >
+            <LogOut style={{ width: "12px", height: "12px" }} />
+            <span>Sign Out</span>
+          </button>
         </div>
       </header>
 
       {/* Main Corporate Workspace */}
       <div style={{ display: "flex", flexDirection: "column", flex: 1, overflow: "hidden" }}>
+
+        {/* Content Section Panel */}
+        <main style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden" }}>
           
-          {/* Top Navigation & Operational Hub Bar */}
-          <nav
-            style={{
-              background: "#ffffff",
-              borderBottom: "1px solid #e2e8f0",
-              display: "flex",
-              flexDirection: "row",
-              justifyContent: "space-between",
-              alignItems: "center",
-              padding: "12px 24px",
-              zIndex: 5,
-              gap: "20px",
-              flexWrap: "wrap",
-            }}
-          >
-            {/* Nav Links */}
-            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-              {[
-                { 
-                  id: "manifest", 
-                  label: "Cargo Manifest List", 
-                  icon: <Layers style={{ width: "15px", height: "15px" }} />,
-                  badge: totalLoadsCount.toString()
-                },
-                { 
-                  id: "search", 
-                  label: "Date Range Search", 
-                  icon: <Calendar style={{ width: "15px", height: "15px" }} />,
-                },
-                { 
-                  id: "add", 
-                  label: editingShipment ? "Edit Selected Shipment" : "Plan New Shipment", 
-                  icon: <PlusCircle style={{ width: "15px", height: "15px" }} />,
-                },
-                { 
-                  id: "flights", 
-                  label: "Flight Schedule Admin", 
-                  icon: <Plane style={{ width: "15px", height: "15px" }} />,
-                  badge: activeFlightsCount.toString()
-                },
-              ].map((item) => {
-                const isActive = activeTab === item.id;
-                return (
-                  <button
-                    key={item.id}
-                    onClick={() => {
-                      if (item.id !== "add" && editingShipment) {
-                        setEditingShipment(null);
-                      }
-                      setActiveTab(item.id as any);
-                    }}
-                    style={{
-                      padding: "8px 16px",
-                      borderRadius: "20px",
-                      border: isActive ? "1px solid #bae6fd" : "1px solid #e2e8f0",
-                      background: isActive ? "#f0f9ff" : "#ffffff",
-                      color: isActive ? "#0369a1" : "#475569",
-                      cursor: "pointer",
-                      display: "flex",
-                      alignItems: "center",
-                      fontSize: "12px",
-                      fontWeight: isActive ? 700 : 500,
-                      gap: "8px",
-                      transition: "all 0.15s ease",
-                      boxShadow: "0 1px 2px rgba(0,0,0,0.02)",
-                    }}
-                    onMouseEnter={(e) => {
-                      if (!isActive) {
-                        e.currentTarget.style.background = "#f8fafc";
-                        e.currentTarget.style.borderColor = "#cbd5e1";
-                      }
-                    }}
-                    onMouseLeave={(e) => {
-                      if (!isActive) {
-                        e.currentTarget.style.background = "#ffffff";
-                        e.currentTarget.style.borderColor = "#e2e8f0";
-                      }
-                    }}
-                  >
-                    <div style={{ color: isActive ? "#0284c7" : "#64748b", display: "flex", alignItems: "center" }}>
-                      {item.icon}
-                    </div>
-                    <span>{item.label}</span>
-                    {item.badge !== undefined && (
-                      <span 
-                        style={{ 
-                          fontSize: "10px", 
-                          fontWeight: 700, 
-                          background: isActive ? "#0284c7" : "#64748b", 
-                          color: "#ffffff", 
-                          padding: "1px 6px", 
-                          borderRadius: "10px" 
-                        }}
-                      >
-                        {item.badge}
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Hub Analytics Summary Panel */}
-            <div style={{ display: "flex", alignItems: "center", gap: "16px", flexWrap: "wrap" }}>
-              {activeTab !== "search" && (
-                <div style={{ display: "flex", alignItems: "center", gap: "12px", background: "#f8fafc", borderRadius: "20px", border: "1px solid #e2e8f0", padding: "6px 16px" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                    <Clock style={{ width: "13px", height: "13px", color: "#0284c7" }} />
-                    <span style={{ fontSize: "11px", fontWeight: 750, color: "#1e293b", textTransform: "uppercase", letterSpacing: "0.03em" }}>Hub Analytics ({toDisplay(selectedDate)}):</span>
-                  </div>
-                  
-                  <div style={{ display: "flex", alignItems: "center", gap: "12px", fontSize: "11px" }}>
-                    <div>
-                      <span style={{ color: "#64748b" }}>Active Loads:</span>
-                      <span style={{ fontWeight: 700, color: "#0f172a", marginLeft: "4px" }}>{totalLoadsCount}</span>
-                    </div>
-                    <span style={{ color: "#e2e8f0" }}>|</span>
-                    <div>
-                      <span style={{ color: "#64748b" }}>Pending Checkoffs:</span>
-                      <span style={{ fontWeight: 700, color: "#e28743", marginLeft: "4px" }}>{pendingCount}</span>
-                    </div>
-                    {aqisCount > 0 && (
-                      <>
-                        <span style={{ color: "#e2e8f0" }}>|</span>
-                        <div style={{ display: "flex", alignItems: "center", gap: "4.5px", color: "#b45309" }}>
-                          <AlertTriangle style={{ width: "11px", height: "11px" }} />
-                          <span style={{ fontWeight: 700 }}>AQIS Holds: {aqisCount}</span>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {/* Cloud Sync active info */}
-              <div style={{ display: "flex", alignItems: "center", gap: "6px", color: "#15803d" }}>
-                <Database style={{ width: "12px", height: "12px", color: "#16a34a" }} />
-                <span style={{ fontSize: "11.5px", fontWeight: 700 }}>Cloud Sync Active</span>
-              </div>
-            </div>
-          </nav>
-
-          {/* Content Section Panel */}
-          <main style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden" }}>
-            
-            {/* Workspace content page */}
-            <div style={{ flex: 1, padding: "24px", overflowY: "auto", background: "#f8fafc" }}>
-              {activeTab === "manifest" && (
+          {/* Workspace content page */}
+          <div style={{ flex: 1, padding: "24px", overflowX: "scroll", overflowY: "scroll", background: "#f8fafc" }}>
+              {activeTab === "manifest" && isTabAllowed("manifest") && (
                 <ShipmentsTab
-                  records={records}
+                  records={portRecords}
                   schedule={schedule}
                   onEdit={handleEditShipmentClick}
                   onDelete={handleDeleteShipment}
@@ -1726,21 +2107,25 @@ export default function App() {
                   onUpdate={handleUpdateShipment}
                   selectedDate={selectedDate}
                   onSelectedDateChange={setSelectedDate}
+                  onGoToFlightSchedule={handleGoToFlightSchedule}
                 />
               )}
 
-              {activeTab === "search" && (() => {
-                const { dupIds, dupDetails } = buildDuplicateSets(records);
+              {activeTab === "search" && isTabAllowed("search") && (() => {
+                const { dupIds, dupDetails } = buildDuplicateSets(portRecords);
                 return (
                   <DateRangeSearch
-                    records={records}
+                    records={portRecords}
                     onEdit={handleEditShipmentClick}
                     onDelete={handleDeleteShipment}
                     onLoadsheet={(r) => setActiveLoadsheet(r)}
                     onJobSheet={(r) => setActiveJobSheet(r)}
                     onToggleComplete={handleToggleComplete}
+                    onUpdate={handleUpdateShipment}
                     dupIds={dupIds}
                     dupDetails={dupDetails}
+                    schedule={schedule}
+                    onGoToFlightSchedule={handleGoToFlightSchedule}
                     open={searchOpen}
                     setOpen={setSearchOpen}
                     from={searchFrom}
@@ -1762,7 +2147,7 @@ export default function App() {
                 );
               })()}
 
-              {activeTab === "add" && (
+              {activeTab === "add" && isTabAllowed("add") && (
                 <EntryForm
                   initial={editingShipment}
                   schedule={schedule}
@@ -1771,14 +2156,672 @@ export default function App() {
                     setActiveTab("manifest");
                   }}
                   onSave={handleAddNewShipment}
+                  onGoToFlights={() => {
+                    setEditingShipment(null);
+                    setActiveTab("settings");
+                    setSettingsSubTab("flights");
+                  }}
                 />
               )}
 
-              {activeTab === "flights" && (
-                <FlightAdmin
-                  schedule={schedule}
-                  onChange={handleScheduleChange}
-                />
+              {activeTab === "settings" && isTabAllowed("settings") && (
+                <div style={{ width: "100%", display: "flex", flexDirection: "column" }}>
+                  <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: "24px" }}>
+                    
+                    {/* Masthead Header */}
+                    <div style={{ background: "linear-gradient(135deg, #0f172a 0%, #1e293b 100%)", borderRadius: "20px", padding: "24px", color: "#ffffff", boxShadow: "0 10px 15px -3px rgba(0, 0, 0, 0.05)" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                        <Settings2 style={{ width: "24px", height: "24px", color: "#38bdf8" }} />
+                        <h2 style={{ fontSize: "20px", fontWeight: 800, margin: 0, letterSpacing: "-0.5px" }}>Administration & Settings</h2>
+                      </div>
+                      <p style={{ margin: "6px 0 0 0", fontSize: "13px", color: "#94a3b8", lineHeight: "1.4" }}>
+                        Configure regional airport station nodes, set administrator overrides, and register dispatchers.
+                      </p>
+                    </div>
+
+
+                    {/* Navigation Sub-Tabs for Settings */}
+                    <div style={{ display: "flex", gap: "12px", borderBottom: "1px solid #cbd5e1", paddingBottom: "14px", marginBottom: "8px", flexWrap: "wrap" }}>
+                      <button
+                        id="subtab-setup-btn"
+                        onClick={() => setSettingsSubTab("setup")}
+                        style={{
+                          padding: "10px 20px",
+                          borderRadius: "12px",
+                          border: settingsSubTab === "setup" ? "1.5px solid #0284c7" : "1px solid #cbd5e1",
+                          backgroundColor: settingsSubTab === "setup" ? "#f0f9ff" : "#ffffff",
+                          color: settingsSubTab === "setup" ? "#0284c7" : "#475569",
+                          fontWeight: 800,
+                          fontSize: "13px",
+                          cursor: "pointer",
+                          transition: "all 0.15s ease",
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "6px",
+                          boxShadow: settingsSubTab === "setup" ? "0 4px 6px -1px rgba(2, 132, 199, 0.08)" : "none"
+                        }}
+                      >
+                        ⚙️ Account Setup
+                      </button>
+                      <button
+                        id="subtab-info-btn"
+                        onClick={() => setSettingsSubTab("info")}
+                        style={{
+                          padding: "10px 20px",
+                          borderRadius: "12px",
+                          border: settingsSubTab === "info" ? "1.5px solid #0284c7" : "1px solid #cbd5e1",
+                          backgroundColor: settingsSubTab === "info" ? "#f0f9ff" : "#ffffff",
+                          color: settingsSubTab === "info" ? "#0284c7" : "#475569",
+                          fontWeight: 800,
+                          fontSize: "13px",
+                          cursor: "pointer",
+                          transition: "all 0.15s ease",
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "6px",
+                          boxShadow: settingsSubTab === "info" ? "0 4px 6px -1px rgba(2, 132, 199, 0.08)" : "none"
+                        }}
+                      >
+                        👥 User Information
+                      </button>
+                      <button
+                        id="subtab-templates-btn"
+                        onClick={() => setSettingsSubTab("templates")}
+                        style={{
+                          padding: "10px 20px",
+                          borderRadius: "12px",
+                          border: settingsSubTab === "templates" ? "1.5px solid #0284c7" : "1px solid #cbd5e1",
+                          backgroundColor: settingsSubTab === "templates" ? "#f0f9ff" : "#ffffff",
+                          color: settingsSubTab === "templates" ? "#0284c7" : "#475569",
+                          fontWeight: 800,
+                          fontSize: "13px",
+                          cursor: "pointer",
+                          transition: "all 0.15s ease",
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "6px",
+                          boxShadow: settingsSubTab === "templates" ? "0 4px 6px -1px rgba(2, 132, 199, 0.08)" : "none"
+                        }}
+                      >
+                        📊 Cargo Templates
+                      </button>
+                      {isTabAllowed("flights") && (
+                        <button
+                          id="subtab-flights-btn"
+                          onClick={() => setSettingsSubTab("flights")}
+                          style={{
+                            padding: "10px 20px",
+                            borderRadius: "12px",
+                            border: settingsSubTab === "flights" ? "1.5px solid #0284c7" : "1px solid #cbd5e1",
+                            backgroundColor: settingsSubTab === "flights" ? "#f0f9ff" : "#ffffff",
+                            color: settingsSubTab === "flights" ? "#0284c7" : "#475569",
+                            fontWeight: 800,
+                            fontSize: "13px",
+                            cursor: "pointer",
+                            transition: "all 0.15s ease",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "6px",
+                            boxShadow: settingsSubTab === "flights" ? "0 4px 6px -1px rgba(2, 132, 199, 0.08)" : "none"
+                          }}
+                        >
+                          ✈️ Flight Schedule Admin
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Admin privileged view */}
+                    <div style={{ display: "flex", flexDirection: "column", gap: "24px" }}>
+                      
+                      {/* Left: Setup account form with subheading */}
+                      {settingsSubTab === "setup" && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                          <h3 id="account-setup-subheading" style={{ fontSize: "14px", fontWeight: 800, color: "#0f172a", margin: "4px 0 2px 2px", paddingBottom: "6px", borderBottom: "2px solid #e2e8f0", textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                            ⚙️ Account Setup
+                          </h3>
+                          <div style={{ background: "#ffffff", borderRadius: "18px", border: "1px solid #e2e8f0", padding: "24px", boxShadow: "0 4px 6px -1px rgba(0,0,0,0.02)", flex: 1 }}>
+                          
+                          {!isUserAdminCurrent() && (
+                            <div style={{ padding: "10px 12px", background: "#fffbeb", border: "1px solid #fef3c7", borderRadius: "10px", color: "#b45309", fontSize: "12px", fontWeight: 700, display: "flex", alignItems: "center", gap: "6px", marginBottom: "16px" }}>
+                              ⚠️ Read-Only Mode: Administrator privilege is required to setup or modify administration accounts.
+                            </div>
+                          )}
+
+                          <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "16px", borderBottom: "1px solid #f1f5f9", paddingBottom: "12px" }}>
+                            <span style={{ fontSize: "15px", fontWeight: 800, color: "#1e293b" }}>
+                              {editingAccount ? "✏️ Edit Administration Account" : "➕ Setup New Administration Account"}
+                            </span>
+                          </div>
+                          
+                          <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                            <div>
+                              <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>Staff name:</label>
+                              <input
+                                type="text"
+                                placeholder="Staff Name"
+                                value={adminAddName}
+                                onChange={(e) => setAdminAddName(e.target.value)}
+                                disabled={!isUserAdminCurrent()}
+                                style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "10px", outline: "none", boxSizing: "border-box", background: !isUserAdminCurrent() ? "#f1f5f9" : "#ffffff" }}
+                              />
+                            </div>
+
+                            <div>
+                              <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>Email Address:</label>
+                              <input
+                                type="email"
+                                placeholder="Email Address"
+                                value={adminAddEmail}
+                                onChange={(e) => setAdminAddEmail(e.target.value)}
+                                disabled={!isUserAdminCurrent() || editingAccount !== null} // email key must remain identical for document ID index
+                                style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "10px", outline: "none", boxSizing: "border-box", background: (!isUserAdminCurrent() || editingAccount) ? "#f1f5f9" : "#ffffff" }}
+                              />
+                            </div>
+
+                            <div>
+                              <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>IATA:</label>
+                              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(100px, 1fr))", gap: "8px", padding: "12px", border: "1px solid #cbd5e1", borderRadius: "10px", background: !isUserAdminCurrent() ? "#f1f5f9" : "#ffffff" }}>
+                                {ALL_STATIONS.map((st) => {
+                                  const checkedStations = (adminAddStation || "").split(",").map(v => v.trim()).filter(Boolean);
+                                  const isChecked = checkedStations.includes(st.value);
+                                  return (
+                                    <label key={st.value} style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px", fontWeight: 600, color: "#334155", cursor: !isUserAdminCurrent() ? "default" : "pointer" }} title={st.label}>
+                                      <input
+                                        type="checkbox"
+                                        checked={isChecked}
+                                        disabled={!isUserAdminCurrent()}
+                                        onChange={(e) => {
+                                          let updated;
+                                          if (e.target.checked) {
+                                            updated = [...checkedStations, st.value];
+                                          } else {
+                                            updated = checkedStations.filter(v => v !== st.value);
+                                          }
+                                          setAdminAddStation(updated.join(", "));
+                                        }}
+                                        style={{ accentColor: "#0284c7", width: "15px", height: "15px", cursor: !isUserAdminCurrent() ? "default" : "pointer" }}
+                                      />
+                                      <span>{st.value}</span>
+                                    </label>
+                                  );
+                                })}
+                              </div>
+                            </div>
+
+                            <div>
+                              <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>Password:</label>
+                              <input
+                                type="text"
+                                placeholder="Set secure password"
+                                value={adminAddPasscode}
+                                onChange={(e) => setAdminAddPasscode(e.target.value)}
+                                disabled={!isUserAdminCurrent()}
+                                style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "10px", outline: "none", boxSizing: "border-box", fontWeight: "bold", color: "#0284c7", background: !isUserAdminCurrent() ? "#f1f5f9" : "#ffffff" }}
+                              />
+                            </div>
+
+                            <div>
+                              <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>Access:</label>
+                              <select
+                                value={adminAddRole}
+                                onChange={(e) => setAdminAddRole(e.target.value)}
+                                disabled={!isUserAdminCurrent()}
+                                style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "10px", outline: "none", boxSizing: "border-box", background: !isUserAdminCurrent() ? "#f1f5f9" : "#ffffff" }}
+                              >
+                                <option value="Standard user">Standard user</option>
+                                <option value="Admin User">Admin User</option>
+                              </select>
+                            </div>
+
+                            {adminAddError && (
+                              <div style={{ padding: "10px 12px", background: "#fef2f2", border: "1px solid #fee2e2", borderRadius: "10px", color: "#ef4444", fontSize: "12px", fontWeight: 600 }}>
+                                ⚠️ {adminAddError}
+                              </div>
+                            )}
+
+                            {adminAddSuccess && (
+                              <div style={{ padding: "10px 12px", background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: "10px", color: "#16a34a", fontSize: "12px", fontWeight: 600 }}>
+                                ✓ {adminAddSuccess}
+                              </div>
+                            )}
+
+                            <div style={{ display: "flex", gap: "8px", marginTop: "4px" }}>
+                              {editingAccount ? (
+                                <>
+                                  <button
+                                    onClick={handleUpdateAdminUser}
+                                    disabled={isSubmittingAdminUser}
+                                    style={{
+                                      flex: 2,
+                                      padding: "12px",
+                                      background: "#16a34a",
+                                      color: "#ffffff",
+                                      border: "none",
+                                      borderRadius: "10px",
+                                      fontSize: "13px",
+                                      fontWeight: 700,
+                                      cursor: "pointer",
+                                      transition: "all 0.15s ease",
+                                      opacity: isSubmittingAdminUser ? 0.7 : 1
+                                    }}
+                                  >
+                                    {isSubmittingAdminUser ? "Saving..." : "💾 Save Changes"}
+                                  </button>
+                                  <button
+                                    onClick={handleCancelEditAccount}
+                                    style={{
+                                      flex: 1,
+                                      padding: "12px",
+                                      background: "#ef4444",
+                                      color: "#ffffff",
+                                      border: "none",
+                                      borderRadius: "10px",
+                                      fontSize: "13px",
+                                      fontWeight: 700,
+                                      cursor: "pointer",
+                                      transition: "all 0.15s ease"
+                                    }}
+                                  >
+                                    Cancel
+                                  </button>
+                                </>
+                              ) : (
+                                <button
+                                  onClick={handleAdminRegisterUser}
+                                  disabled={isSubmittingAdminUser}
+                                  style={{
+                                    width: "100%",
+                                    padding: "12px",
+                                    background: "#0284c7",
+                                    color: "#ffffff",
+                                    border: "none",
+                                    borderRadius: "10px",
+                                    fontSize: "13px",
+                                    fontWeight: 700,
+                                    cursor: "pointer",
+                                    transition: "all 0.15s ease",
+                                    boxShadow: "0 2px 4px rgba(2, 132, 199, 0.1)",
+                                    opacity: isSubmittingAdminUser ? 0.7 : 1
+                                  }}
+                                  onMouseEnter={(e) => { if (!isSubmittingAdminUser) e.currentTarget.style.background = "#0369a1"; }}
+                                  onMouseLeave={(e) => { if (!isSubmittingAdminUser) e.currentTarget.style.background = "#0284c7"; }}
+                                >
+                                  {isSubmittingAdminUser ? "Creating Account..." : "🚀 Create User Account"}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                        </div>
+                      )}
+
+                      {/* Right: Active list of Accounts with subheading */}
+                      {settingsSubTab === "info" && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                          <h3 id="users-information-subheading" style={{ fontSize: "14px", fontWeight: 800, color: "#0f172a", margin: "4px 0 2px 2px", paddingBottom: "6px", borderBottom: "2px solid #e2e8f0", textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                            👥 User Information
+                          </h3>
+                          <div style={{ background: "#ffffff", borderRadius: "18px", border: "1px solid #e2e8f0", padding: "24px", boxShadow: "0 4px 6px -1px rgba(0,0,0,0.02)", display: "flex", flexDirection: "column", flex: 1 }}>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px", borderBottom: "1px solid #f1f5f9", paddingBottom: "12px" }}>
+                            <span style={{ fontSize: "16px", fontWeight: 800, color: "#1e293b" }}>👥 Administration Ledger</span>
+                            <span style={{ fontSize: "11px", fontWeight: 700, background: "#e0f2fe", color: "#0369a1", padding: "2px 8px", borderRadius: "12px" }}>
+                              {getCombinedProfiles().length} Active
+                            </span>
+                          </div>
+
+                          <div style={{ display: "flex", flexDirection: "column", gap: "8px", overflowY: "auto", maxHeight: "450px", flex: 1 }} className="custom-scrollbar">
+                            {/* Standard Profiles (Built-ins) */}
+                            {STATION_PROFILES
+                              .filter(p => isUserAdminCurrent() || p.email.toLowerCase() === currentUser?.email?.toLowerCase())
+                              .map((profile) => {
+                                const showBuiltInPass = currentUser?.email?.toLowerCase() === profile.email.toLowerCase();
+                                const isTargetingThis = passwordResetTarget?.email === profile.email;
+                                const liveUser = workUsers.find(u => u.email.toLowerCase() === profile.email.toLowerCase());
+                                const actualPass = liveUser ? liveUser.passcode : "1234";
+                                return (
+                                  <div key={profile.email} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 14px", border: "1px solid #e2e8f0", borderRadius: "10px", background: "#f8fafc", gap: "12px", flexWrap: "wrap", transition: "all 0.15s ease" }}>
+                                    
+                                    {/* Left Area: Avatar and Info */}
+                                    <div style={{ display: "flex", alignItems: "center", gap: "10px", flex: "1 1 260px", minWidth: 0 }}>
+                                      <div style={{ width: "32px", height: "32px", borderRadius: "50%", background: profile.color, color: "#ffffff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "11px", fontWeight: "bold", flexShrink: 0 }}>
+                                        {profile.initials}
+                                      </div>
+                                      <div style={{ minWidth: 0 }}>
+                                        <div style={{ fontSize: "12.5px", fontWeight: 750, color: "#0f172a", textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: "6px" }}>
+                                          <span>{profile.name}</span>
+                                          <span style={{ fontSize: "9.5px", fontWeight: 700, padding: "1px 5px", borderRadius: "4px", background: "#f1f5f9", color: "#64748b", border: "1px solid #e2e8f0" }}>Built-in</span>
+                                        </div>
+                                        <div style={{ fontSize: "11px", color: "#64748b", textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap" }}>
+                                          ✉ {profile.email}
+                                        </div>
+                                        <div style={{ fontSize: "10.5px", color: "#64748b", marginTop: "1px", display: "flex", alignItems: "center", gap: "6px" }}>
+                                          <span style={{ fontWeight: 650, color: "#0ea5e9" }}>📍 IATA: MEL</span>
+                                          <span style={{ color: "#cbd5e1" }}>•</span>
+                                          <span style={{ color: "#0284c7" }}>Role: Admin User</span>
+                                          <span style={{ color: "#cbd5e1" }}>•</span>
+                                          <span style={{ color: "#475569", fontWeight: 700, fontFamily: "monospace" }}>🔑 {showBuiltInPass ? actualPass : "••••"}</span>
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    {/* Middle Area: Allowed Tabs (All for admin) */}
+                                    <div style={{ display: "flex", flexWrap: "wrap", gap: "4px", flex: "1 1 200px", alignItems: "center" }}>
+                                      {[
+                                        { id: "manifest", name: "Manifest" },
+                                        { id: "search", name: "Search" },
+                                        { id: "add", name: "New Entry" },
+                                        { id: "flights", name: "Flights" },
+                                        { id: "settings", name: "Settings" }
+                                      ].map(tab => (
+                                        <span
+                                          key={tab.id}
+                                          style={{
+                                            padding: "1px 5px",
+                                            fontSize: "9px",
+                                            fontWeight: 700,
+                                            borderRadius: "4px",
+                                            border: "1px solid #16a34a",
+                                            background: "#fdfdfd",
+                                            color: "#16a34a",
+                                            display: "inline-flex",
+                                            alignItems: "center"
+                                          }}
+                                        >
+                                          ✓ {tab.name}
+                                        </span>
+                                      ))}
+                                    </div>
+
+                                    {/* Right Area: Action Controls & Inline password editor */}
+                                    <div style={{ display: "flex", gap: "6px", alignItems: "center", justifyContent: "flex-end" }}>
+                                      {isTargetingThis ? (
+                                        <div style={{ display: "flex", alignItems: "center", gap: "4px", background: "#f0f9ff", padding: "3px 8px", borderRadius: "6px", border: "1px solid #bae6fd" }}>
+                                          <input
+                                            type="text"
+                                            value={newPasswordValue}
+                                            onChange={(e) => setNewPasswordValue(e.target.value)}
+                                            placeholder="New Pass"
+                                            style={{ width: "80px", padding: "3px 6px", fontSize: "11px", border: "1px solid #cbd5e1", borderRadius: "5px", outline: "none" }}
+                                          />
+                                          <button
+                                            onClick={() => handleCommitPasswordChange(profile, newPasswordValue)}
+                                            style={{ background: "#22c55e", color: "#ffffff", border: "none", borderRadius: "5px", padding: "3px 6px", fontSize: "10px", fontWeight: "bold", cursor: "pointer" }}
+                                          >
+                                            Save
+                                          </button>
+                                          <button
+                                            onClick={() => { setPasswordResetTarget(null); setNewPasswordValue(""); }}
+                                            style={{ background: "#94a3b8", color: "#ffffff", border: "none", borderRadius: "5px", padding: "3px 6px", fontSize: "10px", fontWeight: "bold", cursor: "pointer" }}
+                                          >
+                                            Cancel
+                                          </button>
+                                        </div>
+                                      ) : (
+                                        <>
+                                          <button
+                                            onClick={() => setActiveInviteUser({
+                                              displayName: profile.name,
+                                              email: profile.email,
+                                              passcode: actualPass,
+                                              station: "MEL"
+                                            })}
+                                            style={{
+                                              background: "#f0f9ff",
+                                              border: "1px solid #cbd5e1",
+                                              borderRadius: "6px",
+                                              padding: "3px 8px",
+                                              fontSize: "11px",
+                                              fontWeight: 700,
+                                              color: "#0284c7",
+                                              cursor: "pointer"
+                                            }}
+                                            title="Share Setup Details"
+                                          >
+                                            ✉️ Share
+                                          </button>
+                                          {showBuiltInPass && (
+                                            <button
+                                              onClick={() => initiatePasswordReset(profile)}
+                                              style={{
+                                                background: "#0284c7",
+                                                color: "#ffffff",
+                                                border: "none",
+                                                borderRadius: "6px",
+                                                padding: "3px 8px",
+                                                fontSize: "11px",
+                                                fontWeight: 700,
+                                                cursor: "pointer"
+                                              }}
+                                              title="Change Password of this built-in account"
+                                            >
+                                              🔑 Pass
+                                            </button>
+                                          )}
+                                        </>
+                                      )}
+                                    </div>
+
+                                  </div>
+                                );
+                              })}
+
+                            {/* Dynamic Work Users */}
+                            {workUsers
+                              .filter(u => isUserAdminCurrent() || u.email.toLowerCase() === currentUser?.email?.toLowerCase())
+                              .map((item) => {
+                                const showPassword = !isUserAdminCurrent() || (currentUser?.email?.toLowerCase() === item.email.toLowerCase());
+                                const isOwnCard = currentUser?.email?.toLowerCase() === item.email.toLowerCase();
+                                const isTargetingThis = passwordResetTarget?.email === item.email;
+                                return (
+                                  <div key={item.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 14px", border: "1px solid #bae6fd", borderRadius: "10px", background: "#f0f9ff", gap: "12px", flexWrap: "wrap", transition: "all 0.15s ease" }}>
+                                    
+                                    {/* Left Area: Avatar and Work Info */}
+                                    <div style={{ display: "flex", alignItems: "center", gap: "10px", flex: "1 1 260px", minWidth: 0 }}>
+                                      <div style={{ width: "32px", height: "32px", borderRadius: "50%", background: "#0ea5e9", color: "#ffffff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "11px", fontWeight: "bold", flexShrink: 0 }}>
+                                        {item.displayName ? item.displayName.slice(0, 2).toUpperCase() : "ST"}
+                                      </div>
+                                      <div style={{ minWidth: 0 }}>
+                                        <div style={{ fontSize: "12.5px", fontWeight: 750, color: "#0369a1", textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap" }}>
+                                          {item.displayName}
+                                        </div>
+                                        <div style={{ fontSize: "11px", color: "#0284c7", textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap" }}>
+                                          ✉ {item.email}
+                                        </div>
+                                        <div style={{ fontSize: "10.5px", color: "#0891b2", marginTop: "1px", display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                                          <span style={{ fontWeight: 650 }}>📍 IATA: {item.station || "MEL"}</span>
+                                          <span style={{ color: "#bae6fd" }}>•</span>
+                                          <span>Role: {item.role || "Standard user"}</span>
+                                          <span style={{ color: "#bae6fd" }}>•</span>
+                                          <span style={{ fontWeight: 700, fontFamily: "monospace" }}>🔑 {showPassword ? item.passcode : "••••"}</span>
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    {/* Middle Area: Interactive Allowed Tabs */}
+                                    <div style={{ display: "flex", flexWrap: "wrap", gap: "4px", flex: "1 1 200px", alignItems: "center" }}>
+                                      {[
+                                        { id: "manifest", name: "Manifest" },
+                                        { id: "search", name: "Search" },
+                                        { id: "add", name: "New Entry" },
+                                        { id: "flights", name: "Flights" },
+                                        { id: "settings", name: "Settings" }
+                                      ].map(tab => {
+                                        const allowed = !item.allowedTabs || item.allowedTabs.includes(tab.id);
+                                        const canManage = isUserAdminCurrent();
+                                        return (
+                                          <button
+                                            key={tab.id}
+                                            disabled={!canManage}
+                                            onClick={() => toggleUserTabAccess(item, tab.id)}
+                                            style={{
+                                              padding: "1px 5px",
+                                              fontSize: "9px",
+                                              fontWeight: 700,
+                                              borderRadius: "4px",
+                                              border: allowed ? "1px solid #16a34a" : "1px solid #cbd5e1",
+                                              background: allowed ? "#f0fdf4" : "#ffffff",
+                                              color: allowed ? "#15803d" : "#64748b",
+                                              cursor: canManage ? "pointer" : "default",
+                                              display: "inline-flex",
+                                              alignItems: "center",
+                                              gap: "2px",
+                                              transition: "all 0.1s ease",
+                                              opacity: canManage ? 1 : 0.85
+                                            }}
+                                            title={canManage ? `Click to ${allowed ? "revoke" : "grant"} ${tab.name}` : `${tab.name} Access`}
+                                          >
+                                            {allowed ? "✓" : "✗"} {tab.name}
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+
+                                    {/* Right Area: Password reset or edit controls */}
+                                    <div style={{ display: "flex", gap: "6px", alignItems: "center", justifyContent: "flex-end", flexWrap: "wrap" }}>
+                                      {isTargetingThis ? (
+                                        <div style={{ display: "flex", alignItems: "center", gap: "4px", background: "#f0f9ff", padding: "3px 8px", borderRadius: "6px", border: "1px solid #bae6fd" }}>
+                                          <input
+                                            type="text"
+                                            value={newPasswordValue}
+                                            onChange={(e) => setNewPasswordValue(e.target.value)}
+                                            placeholder="New Pass"
+                                            style={{ width: "80px", padding: "3px 6px", fontSize: "11px", border: "1px solid #cbd5e1", borderRadius: "5px", outline: "none" }}
+                                          />
+                                          <button
+                                            onClick={() => handleCommitPasswordChange(item, newPasswordValue)}
+                                            style={{ background: "#22c55e", color: "#ffffff", border: "none", borderRadius: "5px", padding: "3px 6px", fontSize: "10px", fontWeight: "bold", cursor: "pointer" }}
+                                          >
+                                            Save
+                                          </button>
+                                          <button
+                                            onClick={() => { setPasswordResetTarget(null); setNewPasswordValue(""); }}
+                                            style={{ background: "#94a3b8", color: "#ffffff", border: "none", borderRadius: "5px", padding: "3px 6px", fontSize: "10px", fontWeight: "bold", cursor: "pointer" }}
+                                          >
+                                            Cancel
+                                          </button>
+                                        </div>
+                                      ) : (
+                                        <>
+                                          <button
+                                            onClick={() => setActiveInviteUser({
+                                              displayName: item.displayName || "Teammate",
+                                              email: item.email,
+                                              passcode: item.passcode,
+                                              station: item.station || "MEL"
+                                            })}
+                                            style={{
+                                              background: "#f0f9ff",
+                                              border: "1px solid #bae6fd",
+                                              borderRadius: "6px",
+                                              padding: "3px 8px",
+                                              fontSize: "11px",
+                                              fontWeight: 700,
+                                              color: "#0284c7",
+                                              cursor: "pointer"
+                                            }}
+                                            title="Share Setup Details"
+                                          >
+                                            ✉️ Share
+                                          </button>
+
+                                          {(isOwnCard || isUserAdminCurrent()) && (
+                                            <button
+                                              onClick={() => initiatePasswordReset(item)}
+                                              style={{
+                                                background: "#0284c7",
+                                                color: "#ffffff",
+                                                border: "none",
+                                                borderRadius: "6px",
+                                                padding: "3px 8px",
+                                                fontSize: "11px",
+                                                fontWeight: 700,
+                                                cursor: "pointer"
+                                              }}
+                                              title={isOwnCard ? "Change Your Password" : "Reset Password of this user"}
+                                            >
+                                              🔑 Pass
+                                            </button>
+                                          )}
+
+                                          {isUserAdminCurrent() && (
+                                            <>
+                                              <button
+                                                onClick={() => handleEditAccountClick(item)}
+                                                style={{
+                                                  background: "#ffffff",
+                                                  border: "1px solid #bae6fd",
+                                                  borderRadius: "6px",
+                                                  padding: "3px 8px",
+                                                  fontSize: "11px",
+                                                  fontWeight: 700,
+                                                  color: "#0369a1",
+                                                  cursor: "pointer"
+                                                }}
+                                                title="Edit Account Details"
+                                              >
+                                                ✏️ Edit
+                                              </button>
+                                              <button
+                                                onClick={() => handleDeleteWorkUser(item.id)}
+                                                style={{
+                                                  background: "#fef2f2",
+                                                  color: "#ef4444",
+                                                  border: "1px solid #fca5a5",
+                                                  borderRadius: "6px",
+                                                  padding: "3px 8px",
+                                                  cursor: "pointer",
+                                                  fontSize: "11px",
+                                                  fontWeight: 700
+                                                }}
+                                                title="Delete Account"
+                                              >
+                                                Delete
+                                              </button>
+                                            </>
+                                          )}
+                                        </>
+                                      )}
+                                    </div>
+
+                                  </div>
+                                );
+                              })}
+                            
+                            {STATION_PROFILES.length === 0 && workUsers.length === 0 && (
+                              <div style={{ padding: "20px", textShadow: "none", fontSize: "12.5px", color: "#64748b", textAlign: "center", background: "#f8fafc", borderRadius: "12px", border: "1px dashed #cbd5e1" }}>
+                                No custom operations accounts configured yet. Use the left panel to register team members.
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                      )}
+
+                      {settingsSubTab === "templates" && (
+                        <CargoTemplatesSettingsAdmin
+                          currentUser={currentUser}
+                          isAdmin={isUserAdminCurrent()}
+                          selectedPort={selectedPort}
+                          offlineMode={offlineMode}
+                        />
+                      )}
+
+                      {settingsSubTab === "flights" && isTabAllowed("flights") && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                          <h3 id="flight-schedule-subheading" style={{ fontSize: "14px", fontWeight: 800, color: "#0f172a", margin: "4px 0 2px 2px", paddingBottom: "6px", borderBottom: "2px solid #e2e8f0", textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                            ✈️ Flight Schedule Administrative Ledger
+                          </h3>
+                          <FlightAdmin
+                            schedule={schedule}
+                            onChange={handleScheduleChange}
+                            highlightFlight={highlightFlight}
+                            onClearHighlightFlight={() => setHighlightFlight(null)}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
               )}
             </div>
           </main>
@@ -1790,7 +2833,16 @@ export default function App() {
       )}
 
       {activeLoadsheet && (
-        <LoadsheetModal key={activeLoadsheet.id} row={activeLoadsheet} currentUser={currentUser} offlineMode={offlineMode} onClose={() => setActiveLoadsheet(null)} />
+        <LoadsheetModal
+          key={activeLoadsheet.id}
+          row={records.find(r => r.id === activeLoadsheet.id) || activeLoadsheet}
+          currentUser={currentUser}
+          offlineMode={offlineMode}
+          onUpdateShipment={handleUpdateShipment}
+          onClose={() => setActiveLoadsheet(null)}
+          isAdmin={isUserAdminCurrent()}
+          activePort={selectedPort}
+        />
       )}
 
       <InviteModal
@@ -1883,12 +2935,26 @@ export default function App() {
                   </code>
                   <button
                     onClick={() => {
-                      navigator.clipboard.writeText("SW-P9VGV1E1NA");
-                      alert("Copied Code to clipboard! Send to your colleagues.");
+                      const txt = "SW-P9VGV1E1NA";
+                      if (navigator.clipboard?.writeText) {
+                        navigator.clipboard.writeText(txt);
+                      } else {
+                        const textArea = document.createElement("textarea");
+                        textArea.value = txt;
+                        textArea.style.position = "fixed";
+                        textArea.style.left = "-9999px";
+                        document.body.appendChild(textArea);
+                        textArea.focus();
+                        textArea.select();
+                        document.execCommand("copy");
+                        document.body.removeChild(textArea);
+                      }
+                      setCopiedShareCode(true);
+                      setTimeout(() => setCopiedShareCode(false), 2000);
                     }}
-                    style={{ background: "#0f172a", border: "none", color: "#ffffff", padding: "8px 12px", borderRadius: "8px", fontSize: "12px", fontWeight: 700, cursor: "pointer" }}
+                    style={{ background: copiedShareCode ? "#16a34a" : "#0f172a", border: "none", color: "#ffffff", padding: "8px 12px", borderRadius: "8px", fontSize: "12px", fontWeight: 700, cursor: "pointer", transition: "all 0.15s ease" }}
                   >
-                    Copy Code
+                    {copiedShareCode ? "✓ Copied" : "Copy Code"}
                   </button>
                 </div>
                 <p style={{ fontSize: "11px", color: "#64748b", margin: "8px 0 14px 0" }}>
@@ -1903,15 +2969,26 @@ export default function App() {
                   </p>
                   <button
                     onClick={() => {
-                      const rawOrigin = typeof window !== "undefined" ? window.location.origin : "https://scheduler-app.com";
-                      let cleanOrigin = rawOrigin;
-                      const directJoinLink = `${cleanOrigin}?workspaceId=SW-P9VGV1E1NA&workspaceName=${encodeURIComponent("Melbourne Export Air (MAP) Workspace")}`;
-                      navigator.clipboard.writeText(directJoinLink);
-                      alert("Copied custom Direct Workspace Link! Send this link to colleagues.");
+                      const directJoinLink = "https://seaway-cargo-manifest.vercel.app/";
+                      if (navigator.clipboard?.writeText) {
+                        navigator.clipboard.writeText(directJoinLink);
+                      } else {
+                        const textArea = document.createElement("textarea");
+                        textArea.value = directJoinLink;
+                        textArea.style.position = "fixed";
+                        textArea.style.left = "-9999px";
+                        document.body.appendChild(textArea);
+                        textArea.focus();
+                        textArea.select();
+                        document.execCommand("copy");
+                        document.body.removeChild(textArea);
+                      }
+                      setCopiedDirectLink(true);
+                      setTimeout(() => setCopiedDirectLink(false), 2000);
                     }}
                     style={{ 
                       width: "100%", 
-                      background: "#16a34a", 
+                      background: copiedDirectLink ? "#15803d" : "#16a34a", 
                       border: "none", 
                       color: "#ffffff", 
                       padding: "10px", 
@@ -1922,10 +2999,11 @@ export default function App() {
                       display: "flex", 
                       alignItems: "center", 
                       justifyContent: "center", 
-                      gap: "6px" 
+                      gap: "6px",
+                      transition: "all 0.15s ease"
                     }}
                   >
-                    🔗 Copy Direct Join Link
+                    {copiedDirectLink ? "✓ Copied to Clipboard" : "🔗 Copy Direct Join Link"}
                   </button>
 
                   {/* Email Live Collaboration Option */}
@@ -1950,13 +3028,11 @@ export default function App() {
                         onClick={() => {
                           const el = document.getElementById("collab-invite-email") as HTMLInputElement;
                           const email = el ? el.value.trim() : "";
-                          const rawOrigin = typeof window !== "undefined" ? window.location.origin : "https://scheduler-app.com";
-                          let cleanOrigin = rawOrigin;
-                          const directJoinLink = `${cleanOrigin}?workspaceId=SW-P9VGV1E1NA&workspaceName=${encodeURIComponent("Melbourne Export Air (MAP) Workspace")}`;
+                          const directJoinLink = "https://seaway-cargo-manifest.vercel.app/";
                           
-                          const subject = encodeURIComponent("Action Required: Join Live Cargo Scheduler Workspace - Melbourne Export Air (MAP) Workspace");
+                          const subject = encodeURIComponent("Action Required: Join Live Cargo Scheduler Workspace");
                           const body = encodeURIComponent(
-                            "Dear Ops Team,\n\nYou have been authorized to join our live cargo operations workspace so we can collaborate on cargo manifests, checklists, loadsheets, and flight schedules in real-time.\n\nPlease click the direct operations link below to join instantly:\n" + directJoinLink + "\n\nWorkspace Name: Melbourne Export Air (MAP) Workspace\nWorkspace ID: SW-P9VGV1E1NA\n\nBest regards,\nOperations Dispatch Team"
+                            "Dear Ops Team,\n\nYou have been authorized to join our live cargo operations workspace so we can collaborate on cargo manifests, checklists, loadsheets, and flight schedules in real-time.\n\nPlease click the direct operations link below to join instantly:\n" + directJoinLink + "\n\nBest regards,\nOperations Dispatch Team"
                           );
                           
                           window.location.href = `mailto:${encodeURIComponent(email)}?subject=${subject}&body=${body}`;
@@ -1980,11 +3056,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  {typeof window !== "undefined" && window.location.origin.includes("ais-dev-") && (
-                    <div style={{ fontSize: "10px", color: "#166534", background: "#f0fdf4", padding: "8px 10px", borderRadius: "6px", border: "1px solid #bbf7d0", marginTop: "10px", lineHeight: "1.3" }}>
-                      ✅ <strong>Direct Working Link Enabled:</strong> The custom workspace join link has been configured to use your active working URL (<code>ais-dev-...</code>) to ensure colleagues can connect and collaborate seamlessly!
-                    </div>
-                  )}
+
                 </div>
               </div>
 
@@ -2144,10 +3216,11 @@ export default function App() {
                       />
                       <input
                         type="text"
-                        disabled
-                        value="1234"
-                        style={{ width: "120px", padding: "8px 10px", fontSize: "12.5px", border: "1px solid #cbd5e1", borderRadius: "8px", boxSizing: "border-box", background: "#f1f5f9", color: "#475569", fontWeight: "bold", textAlign: "center", cursor: "not-allowed" }}
-                        title="Security PIN is fixed to 1234 for streamlined station access."
+                        value={adminAddPasscode}
+                        onChange={(e) => setAdminAddPasscode(e.target.value)}
+                        placeholder="Passcode"
+                        style={{ width: "125px", padding: "8px 10px", fontSize: "12.5px", border: "1px solid #cbd5e1", borderRadius: "8px", boxSizing: "border-box", background: "#ffffff", color: "#0284c7", fontWeight: "extrabold", textAlign: "center" }}
+                        title="Enter a custom password or login PIN for this workstation."
                       />
                     </div>
                     <input

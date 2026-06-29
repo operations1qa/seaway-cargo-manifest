@@ -9,14 +9,16 @@ import { T } from "../utils/theme";
 interface PillProps {
   text: string;
   color: string;
+  textColor?: string;
+  style?: React.CSSProperties;
 }
 
-export const Pill: React.FC<PillProps> = ({ text, color }) => {
+export const Pill: React.FC<PillProps> = ({ text, color, textColor = "#000000", style }) => {
   return (
     <span
       style={{
         background: color + "14",
-        color: "#000000",
+        color: textColor,
         border: `1px solid ${color}29`,
         borderRadius: "9999px", // Bubble style!
         padding: "3px 10px",
@@ -24,6 +26,7 @@ export const Pill: React.FC<PillProps> = ({ text, color }) => {
         fontWeight: 600,
         whiteSpace: "nowrap",
         display: "inline-block",
+        ...style,
       }}
     >
       {text || "—"}

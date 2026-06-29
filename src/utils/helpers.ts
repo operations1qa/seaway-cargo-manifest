@@ -111,6 +111,45 @@ export const subtractHour = (t: string): string => {
   return newHour + p.slice(2);
 };
 
+export const isUrgentShipment = (row: any): boolean => {
+  if (!row || row.complete) return false;
+  if (!row.cutoff || !row.date) return false;
+
+  // Clean cutoff time, supporting both HH:MM and HHMM formats
+  const cleanTime = String(row.cutoff).replace(/\D/g, "").padStart(4, "0");
+  if (cleanTime.length !== 4) return false;
+
+  const hours = parseInt(cleanTime.slice(0, 2), 10);
+  const minutes = parseInt(cleanTime.slice(2, 4), 10);
+
+  if (isNaN(hours) || isNaN(minutes)) return false;
+
+  // Rule: except cutoff between 7:00 AM and 9:00 AM
+  const cutoffMinutes = hours * 60 + minutes;
+  if (cutoffMinutes >= 420 && cutoffMinutes <= 540) {
+    return false;
+  }
+
+  // Clean date, supporting DDMMYYYY format
+  const cleanDate = String(row.date).replace(/\D/g, "");
+  if (cleanDate.length !== 8) return false;
+
+  const day = parseInt(cleanDate.slice(0, 2), 10);
+  const month = parseInt(cleanDate.slice(2, 4), 10) - 1;
+  const year = parseInt(cleanDate.slice(4), 10);
+
+  if (isNaN(day) || isNaN(month) || isNaN(year)) return false;
+
+  const cutoffDate = new Date(year, month, day, hours, minutes, 0, 0);
+  const now = new Date();
+
+  const diffMs = cutoffDate.getTime() - now.getTime();
+  const diffHours = diffMs / (1000 * 60 * 60);
+
+  // Highlight red if it's within 2 hours of/before cutoff (including past/overdue)
+  return diffHours <= 2;
+};
+
 export const todayStr = (): string => {
   const d = new Date();
   const day = String(d.getDate()).padStart(2, "0");

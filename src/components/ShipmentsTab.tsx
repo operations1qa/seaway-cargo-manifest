@@ -7,8 +7,9 @@ import React, { useState, useMemo, useRef } from "react";
 import * as XLSX from "xlsx";
 import { Shipment, FlightSchedule } from "../types";
 import { T, cCol } from "../utils/theme";
-import { toDisplay, todayStr, generateJobSheetHtml, subtractHour, getDayOfWeek, formatAwb } from "../utils/helpers";
+import { toDisplay, todayStr, generateJobSheetHtml, subtractHour, getDayOfWeek, formatAwb, isUrgentShipment } from "../utils/helpers";
 import { Pill } from "./UIAtoms";
+import { AirlineInfoModal } from "./AirlineInfoModal";
 import { 
   ChevronLeft, 
   ChevronRight, 
@@ -39,6 +40,7 @@ interface ShipmentsTabProps {
   onUpdate?: (id: number, fields: Partial<Shipment>) => void;
   selectedDate?: string;
   onSelectedDateChange?: (date: string) => void;
+  onGoToFlightSchedule?: (flightCode: string) => void;
 }
 
 // Helper to deduce duplicate actual ULD numbers (e.g. PMC13511QF, AKE92169CX, etc.)
@@ -207,48 +209,73 @@ const exportToExcel = (rows: Shipment[], filename: string) => {
   URL.revokeObjectURL(url);
 };
 
-const DeleteButton: React.FC<{ onDelete: (id: number) => void; id: number }> = ({ onDelete, id }) => {
-  const [confirming, setConfirming] = useState(false);
-  const timerRef = useRef<any>(null);
+const DeleteButton: React.FC<{
+  onDelete: (id: number) => void;
+  onUpdate?: (id: number, fields: Partial<Shipment>) => void;
+  id: number;
+  confirmDelete?: boolean;
+  deleteSured?: boolean;
+}> = ({ onDelete, onUpdate, id, confirmDelete, deleteSured }) => {
+  const buttonRef = React.useRef<HTMLButtonElement>(null);
+
+  const isConfirming = !!confirmDelete && !deleteSured;
+  const isSured = !!deleteSured;
+  const buttonText = isConfirming ? "SURE?" : "DELETE";
+
+  React.useEffect(() => {
+    if (!isConfirming) return;
+
+    const handleOutsideClick = (e: MouseEvent) => {
+      if (buttonRef.current && !buttonRef.current.contains(e.target as Node)) {
+        if (onUpdate) {
+          onUpdate(id, { confirmDelete: false, deleteSured: false });
+        }
+      }
+    };
+
+    document.addEventListener("click", handleOutsideClick, true);
+    return () => {
+      document.removeEventListener("click", handleOutsideClick, true);
+    };
+  }, [isConfirming, id, onUpdate]);
 
   const handleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (confirming) {
+    if (confirmDelete && !deleteSured) {
+      // When clicking "SURE?", save marked state: confirmDelete turns false, deleteSured turns true
+      if (onUpdate) {
+        onUpdate(id, { confirmDelete: false, deleteSured: true });
+      }
+    } else if (deleteSured) {
+      // Already marked black. Clicking "DELETE" deletes completely
       onDelete(id);
-      setConfirming(false);
-      if (timerRef.current) clearTimeout(timerRef.current);
     } else {
-      setConfirming(true);
-      timerRef.current = setTimeout(() => {
-        setConfirming(false);
-      }, 3000);
+      // Normal state. Clicking "DELETE" shows "SURE?"
+      if (onUpdate) {
+        onUpdate(id, { confirmDelete: true, deleteSured: false });
+      }
     }
   };
 
-  React.useEffect(() => {
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-    };
-  }, []);
-
   return (
     <button
+      ref={buttonRef}
       onClick={handleClick}
-      title={confirming ? "Click again to confirm deletion" : "Delete load record"}
+      title={isSured ? "Marked black - click to delete completely" : isConfirming ? "Click SURE to mark this row" : "Delete load record"}
       style={{
-        background: confirming ? "#fee2e2" : T.redBg,
-        border: `1px solid ${confirming ? "#ef4444" : "#fecaca"}`,
-        color: "#000000",
+        background: isSured ? "#ef4444" : isConfirming ? "#000000" : T.redBg,
+        border: `1px solid ${isSured ? "#ef4444" : isConfirming ? "#ffffff" : "#fecaca"}`,
+        color: (isSured || isConfirming) ? "#ffffff" : "#000000",
         borderRadius: 4,
         padding: "3px 6px",
         cursor: "pointer",
         fontSize: 11,
-        fontWeight: confirming ? 800 : 500,
+        fontWeight: (isSured || isConfirming) ? 900 : 500,
         whiteSpace: "nowrap",
         transition: "all 0.1s",
       }}
     >
-      {confirming ? "Sure?" : "Del"}
+      {buttonText}
     </button>
   );
 };
@@ -265,6 +292,7 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
   onUpdate,
   selectedDate,
   onSelectedDateChange,
+  onGoToFlightSchedule,
 }) => {
   const today = todayStr();
   const [localDate, setLocalDate] = useState(today);
@@ -272,19 +300,76 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
   const setSelDate = onSelectedDateChange !== undefined ? onSelectedDateChange : setLocalDate;
   const [search, setSearch] = useState("");
   const [selectedJobs, setSelectedJobs] = useState<Set<number>>(new Set());
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<number | null>(null);
+  const [selectedAirlineFlight, setSelectedAirlineFlight] = useState<string | null>(null);
+  const [highlightedRowId, setHighlightedRowId] = useState<number | null>(null);
+  const [showOtherDaysDups, setShowOtherDaysDups] = useState(false);
   const importRef = useRef<HTMLInputElement>(null);
+
+  const handleScrollToRow = (rowId: number) => {
+    setHighlightedRowId(rowId);
+    setTimeout(() => {
+      const el = document.getElementById("shipment-row-" + rowId);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }, 50);
+    setTimeout(() => {
+      setHighlightedRowId(null);
+    }, 2500);
+  };
+
+  const handleGoToConflict = (conflictId: number, dateStr: string) => {
+    if (selDate !== dateStr) {
+      setSelDate(dateStr);
+    }
+    setTimeout(() => {
+      handleScrollToRow(conflictId);
+    }, 150);
+  };
   
   // SOP / FAQ Guide state variables
   const [showSopGuide, setShowSopGuide] = useState(false);
   const [sopSubTab, setSopSubTab] = useState<"sop" | "faq">("sop");
 
-  // Clear bulk print selections when selected date or search text changes
+  // Clear bulk print status and active delete highlights when selected date or search text changes
   React.useEffect(() => {
     setSelectedJobs(new Set());
+    setConfirmingDeleteId(null);
   }, [selDate, search]);
 
   const allDates = useMemo(() => [...new Set(records.map((r) => r.date))].sort(), [records]);
   const { dupIds, dupDetails } = useMemo(() => buildDuplicateSets(records), [records]);
+
+  const getDayMismatchInfo = (flightCode: string, dateStr: string) => {
+    if (!flightCode || !dateStr || dateStr.length !== 8) return null;
+    const sched = schedule[flightCode.toUpperCase()];
+    if (!sched) return null;
+
+    const daysConfig = (sched.days || ".......").padEnd(7, ".");
+    const s = dateStr.replace(/\D/g, "");
+    if (s.length !== 8) return null;
+    const day = parseInt(s.slice(0, 2), 10);
+    const month = parseInt(s.slice(2, 4), 10) - 1;
+    const year = parseInt(s.slice(4), 10);
+    if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
+    
+    const dObj = new Date(year, month, day);
+    const jsDay = dObj.getDay(); // 0-6 (Sun-Sat)
+    
+    // MTWTFSS index: Monday is 0, Sunday is 6
+    const mtwtfssIdx = jsDay === 0 ? 6 : jsDay - 1;
+    const isAllocated = daysConfig[mtwtfssIdx] !== "." && daysConfig[mtwtfssIdx] !== "-" && daysConfig[mtwtfssIdx] !== " ";
+    
+    if (!isAllocated) {
+      const weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+      return {
+        dayName: weekdays[jsDay],
+        daysConfig: sched.days || "No days allocated",
+      };
+    }
+    return null;
+  };
 
   const dayRecords = useMemo(() => {
     const q = search.toLowerCase();
@@ -322,6 +407,10 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
       return (a[sk] || "").toString().localeCompare((b[sk] || "").toString()) * sd;
     });
   }, [dayRecords, sk, sd]);
+
+  const mismatchCount = useMemo(() => {
+    return finalSorted.filter(row => !row.complete && getDayMismatchInfo(row.flight, row.date)).length;
+  }, [finalSorted, schedule]);
 
   const TH = (k: keyof Shipment, lbl: string, w?: number) => (
     <th
@@ -453,23 +542,20 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
 
   const downloadImportTemplate = () => {
     const headers = [
-      "date(ddmmyyyy)",
-      "cutoff",
-      "shipper",
-      "awb",
-      "flight",
-      "cto",
-      "uld",
-      "unitNum",
-      "ice",
-      "dest",
-      "commodity",
-      "specialInst",
-      "scr",
-      "operator",
-      "loadType",
-      "jobRef",
-      "consolRef",
+      "DATE(DDMMYYYY)*",
+      "CUTOFF",
+      "SHIPPER",
+      "AWB*",
+      "FLIGHT*",
+      "CTO",
+      "ULD",
+      "ICE",
+      "DEST",
+      "COMMODITY",
+      "SPECIALINST",
+      "SCR",
+      "OPERATOR",
+      "LOADTYPE*"
     ];
     const example = [
       "13062026",
@@ -479,23 +565,25 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
       "QF029",
       "QANTAS",
       "1 X PMC",
-      "PMC13511QF",
       "45",
       "HKG",
       "DAIRY",
       "FOIL / ICE / TEMP",
       "YES",
       "Mohamed",
-      "UNIT",
-      "JR001",
-      "CR001",
+      "UNIT"
     ];
-    const csv = [headers, example].map((r) => r.join(",")).join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+
+    const worksheet = XLSX.utils.aoa_to_sheet([headers, example]);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "ShipmentsTemplate");
+
+    const excelBuffer = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
+    const blob = new Blob([excelBuffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "seaway_import_template.csv";
+    a.download = "shipment_import_template.xlsx";
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -506,31 +594,33 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
-        const text = ev.target?.result as string;
-        const lines = text.split(/\r?\n/).filter((l) => l.trim());
-        if (lines.length < 2) {
+        const data = new Uint8Array(ev.target?.result as ArrayBuffer);
+        const workbook = XLSX.read(data, { type: "array" });
+        const firstSheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[firstSheetName];
+        
+        // Convert worksheet to raw arrays of array (header: 1)
+        const rawRows = XLSX.utils.sheet_to_json<any[]>(worksheet, { header: 1 });
+        if (rawRows.length < 2) {
           alert("File appears empty or has no data rows.");
           return;
         }
         
-        const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, "").toLowerCase());
-        const colIdx = (key: string) => headers.indexOf(key);
+        const headers = rawRows[0].map((h) => String(h || "").trim().toLowerCase().replace(/\*/g, ""));
+        const colIdx = (key: string) => headers.indexOf(key.toLowerCase().replace(/\*/g, ""));
         
-        const getCell = (row: string[], key: string) => {
+        const getCell = (row: any[], key: string) => {
           const idx = colIdx(key);
-          if (idx < 0) return "";
-          return (row[idx] || "").trim().replace(/^"|"$/g, "");
+          if (idx < 0 || row[idx] === undefined || row[idx] === null) return "";
+          return String(row[idx]).trim();
         };
 
         const newRows: Omit<Shipment, "id">[] = [];
         let imported = 0;
 
-        lines.slice(1).forEach((line) => {
-          if (!line.trim()) return;
-          
-          // Split on comma except when commas are inside double quotes
-          const row = line.match(/(".*?"|[^,]+|(?<=,)(?=,)|(?<=,)$|^(?=,))/g) || line.split(",");
-          const cleanRow = row.map((val) => val.trim());
+        rawRows.slice(1).forEach((cleanRow) => {
+          if (!cleanRow || cleanRow.length === 0) return;
+          if (cleanRow.every(c => c === undefined || c === null || String(c).trim() === "")) return;
           
           const dateOrig = getCell(cleanRow, "date(ddmmyyyy)") || getCell(cleanRow, "date");
           const awb = getCell(cleanRow, "awb");
@@ -606,7 +696,7 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
         alert("Import failed: " + err.message);
       }
     };
-    reader.readAsText(file);
+    reader.readAsArrayBuffer(file);
     e.target.value = ""; // Reset
   };
 
@@ -779,7 +869,13 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
 
   const completedCount = dayRecords.filter((r) => r.complete).length;
   const dupCount = dayRecords.filter((r) => dupIds.has(r.id)).length;
+  const otherDaysDupCount = useMemo(() => {
+    return records.filter((r) => r.date !== selDate && dupIds.has(r.id)).length;
+  }, [records, selDate, dupIds]);
   const selectedCount = finalSorted.filter((r) => selectedJobs.has(r.id)).length;
+  const urgentCount = useMemo(() => {
+    return dayRecords.filter((r) => isUrgentShipment(r)).length;
+  }, [dayRecords]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -807,83 +903,6 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
         >
           {/* Left: Date Switcher & Segmented Controls */}
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                background: "#f5f5f7",
-                border: "1px solid #e5e7eb",
-                borderRadius: 24,
-                padding: "2px",
-                boxShadow: "0 1px 2px rgba(0,0,0,0.02)",
-              }}
-            >
-              <button
-                onClick={() => prevDate && setSelDate(prevDate)}
-                disabled={!prevDate}
-                title="Previous Day"
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: prevDate ? T.text : T.textMuted,
-                  borderRadius: "50%",
-                  width: 32,
-                  height: 32,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  cursor: prevDate ? "pointer" : "default",
-                }}
-              >
-                <ChevronLeft size={16} />
-              </button>
-
-              <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 10px", color: T.text }}>
-                <Calendar size={14} style={{ color: T.textMuted }} />
-                <input
-                  type="date"
-                  value={selDate.length === 8 ? `${selDate.slice(4)}-${selDate.slice(2, 4)}-${selDate.slice(0, 2)}` : ""}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    if (v) {
-                      const d = v.split("-");
-                      setSelDate(d[2] + d[1] + d[0]);
-                    }
-                  }}
-                  style={{
-                    background: "transparent",
-                    border: "none",
-                    cursor: "pointer",
-                    fontSize: 13,
-                    fontWeight: 700,
-                    color: T.text,
-                    outline: "none",
-                    padding: "2px 0",
-                  }}
-                />
-              </div>
-
-              <button
-                onClick={() => nextDate && setSelDate(nextDate)}
-                disabled={!nextDate}
-                title="Next Day"
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: nextDate ? T.text : T.textMuted,
-                  borderRadius: "50%",
-                  width: 32,
-                  height: 32,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  cursor: nextDate ? "pointer" : "default",
-                }}
-              >
-                <ChevronRight size={16} />
-              </button>
-            </div>
-
             <button
               onClick={() => setSelDate(todayStr())}
               style={{
@@ -900,6 +919,105 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
             >
               Today
             </button>
+
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                background: "#f5f5f7",
+                border: "1px solid #e5e7eb",
+                borderRadius: 28,
+                padding: "3px",
+                boxShadow: "0 1px 2px rgba(0,0,0,0.02)",
+                position: "relative",
+              }}
+            >
+              <button
+                onClick={() => prevDate && setSelDate(prevDate)}
+                disabled={!prevDate}
+                title="Previous Day"
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: prevDate ? T.text : T.textMuted,
+                  borderRadius: "50%",
+                  width: 40,
+                  height: 40,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  cursor: prevDate ? "pointer" : "default",
+                  transition: "background 0.15s",
+                }}
+                onMouseEnter={(e) => {
+                  if (prevDate) e.currentTarget.style.background = "rgba(0,0,0,0.04)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "transparent";
+                }}
+              >
+                <ChevronLeft size={22} style={{ strokeWidth: 2.2 }} />
+              </button>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 14px", color: T.text, position: "relative" }}>
+                <Calendar size={18} style={{ color: T.textMuted }} />
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", lineHeight: "1.15" }}>
+                  <span style={{ fontSize: 9.5, fontWeight: 750, textTransform: "uppercase", color: T.textMuted, letterSpacing: "0.06em" }}>
+                    {selDate ? getDayOfWeek(selDate) : "—"}
+                  </span>
+                  <span style={{ fontSize: 16, fontWeight: 900, color: "#000000", letterSpacing: "-0.01em" }}>
+                    {selDate ? toDisplay(selDate) : "—"}
+                  </span>
+                </div>
+                <input
+                  type="date"
+                  value={selDate.length === 8 ? `${selDate.slice(4)}-${selDate.slice(2, 4)}-${selDate.slice(0, 2)}` : ""}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v) {
+                      const d = v.split("-");
+                      setSelDate(d[2] + d[1] + d[0]);
+                    }
+                  }}
+                  style={{
+                    opacity: 0,
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    height: "100%",
+                    cursor: "pointer",
+                  }}
+                />
+              </div>
+
+              <button
+                onClick={() => nextDate && setSelDate(nextDate)}
+                disabled={!nextDate}
+                title="Next Day"
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: nextDate ? T.text : T.textMuted,
+                  borderRadius: "50%",
+                  width: 40,
+                  height: 40,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  cursor: nextDate ? "pointer" : "default",
+                  transition: "background 0.15s",
+                }}
+                onMouseEnter={(e) => {
+                  if (nextDate) e.currentTarget.style.background = "rgba(0,0,0,0.04)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "transparent";
+                }}
+              >
+                <ChevronRight size={22} style={{ strokeWidth: 2.2 }} />
+              </button>
+            </div>
 
             <span
               style={{
@@ -988,60 +1106,13 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
           }}
         >
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-            {/* Print selected job sheets */}
-            <button
-              onClick={printSelectedJobSheets}
-              disabled={selectedCount === 0}
-              title={selectedCount === 0 ? "Tick checkboxes in shipment list first to select" : "Print selected job sheets"}
-              style={{
-                background: selectedCount > 0 ? T.amberBg : "#f5f5f7",
-                border: `1px solid ${selectedCount > 0 ? T.amber : "#e5e7eb"}`,
-                color: selectedCount > 0 ? "#b45309" : T.textMuted,
-                borderRadius: 20,
-                padding: "8px 16px",
-                cursor: selectedCount > 0 ? "pointer" : "default",
-                fontSize: 12,
-                fontWeight: 700,
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                transition: "all 0.15s",
-              }}
-            >
-              <Printer size={13} />
-              <span>Bulk Print Job Sheets {selectedCount > 0 ? `(${selectedCount})` : ""}</span>
-            </button>
-
-            {/* Print manifest PDF button */}
-            <button
-              onClick={printManifestToPDF}
-              disabled={dayRecords.length === 0}
-              title="Print standard, high-contrast landscape PDF Manifest for external sharing"
-              style={{
-                background: dayRecords.length > 0 ? "#ecfeff" : "#f5f5f7",
-                border: `1px solid ${dayRecords.length > 0 ? "#a5f3fc" : "#e5e7eb"}`,
-                color: dayRecords.length > 0 ? "#0891b2" : T.textMuted,
-                borderRadius: 20,
-                padding: "8px 16px",
-                cursor: dayRecords.length > 0 ? "pointer" : "default",
-                fontSize: 12,
-                fontWeight: 700,
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                transition: "all 0.15s",
-              }}
-            >
-              <FileText size={13} />
-              <span>Print to PDF</span>
-            </button>
           </div>
 
           {/* Import / Template section */}
           <div style={{ display: "flex", background: "#f3f4f6", borderRadius: 20, padding: 2, border: "1px solid #e5e7eb" }}>
             <button
               onClick={downloadImportTemplate}
-              title="Download empty CSV template for import"
+              title="Download Excel template for import"
               style={{
                 background: "transparent",
                 border: "none",
@@ -1057,7 +1128,7 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
               }}
             >
               <Download size={12} />
-              <span>Template</span>
+              <span>Template Download</span>
             </button>
             <div style={{ width: 1, background: "#d2d2d7", margin: "4px 0" }}></div>
             <button
@@ -1079,85 +1150,287 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
               <Upload size={12} />
               <span>Import Jobs</span>
             </button>
-            <input ref={importRef} type="file" accept=".csv,.txt" style={{ display: "none" }} onChange={handleImportFile} />
+            <input ref={importRef} type="file" accept=".xlsx,.xls,.csv" style={{ display: "none" }} onChange={handleImportFile} />
           </div>
         </div>
       </div>
 
-      {/* Day header bar */}
-      <div
-        style={{
-          background: "#ffffff",
-          border: "1px solid #e5e7eb",
-          borderRadius: 16,
-          padding: "14px 20px",
-          display: "flex",
-          alignItems: "center",
-          gap: 16,
-          flexWrap: "wrap",
-          boxShadow: "0 8px 24px rgba(0,0,0,0.03)",
-        }}
-      >
-        <span style={{ color: T.accent, fontWeight: 800, fontSize: 16, display: "flex", alignItems: "center", gap: 8 }}>
-          <span>📅 {toDisplay(selDate) || "No date selected"}</span>
-          {selDate && (
-            <span style={{ background: T.accentBg, color: T.accent, fontSize: 11, fontWeight: 800, padding: "2px 10px", borderRadius: 12, textTransform: "uppercase", letterSpacing: "0.5px" }}>
-              {getDayOfWeek(selDate)}
-            </span>
-          )}
-        </span>
-        <span style={{ color: T.textMid, fontSize: 12, fontWeight: 500 }}>
-          {finalSorted.length} shipment{finalSorted.length !== 1 ? "s" : ""}
-        </span>
-        {completedCount > 0 && (
-          <span style={{ background: T.greenBg, color: T.green, border: `1px solid ${T.green}44`, borderRadius: 20, padding: "3px 12px", fontSize: 11, fontWeight: 700 }}>
-            ✓ {completedCount} completed
-          </span>
-        )}
-        {selectedCount > 0 && (
-          <span style={{ background: T.amberBg, color: T.amber, border: `1px solid ${T.amber}44`, borderRadius: 20, padding: "3px 12px", fontSize: 11, fontWeight: 700 }}>
-            📄 {selectedCount} job{selectedCount !== 1 ? "s" : ""} selected
-          </span>
-        )}
-        {dupCount > 0 && (
-          <span style={{ background: T.redBg, color: T.red, border: `1px solid ${T.red}44`, borderRadius: 20, padding: "3px 12px", fontSize: 11, fontWeight: 700 }}>
-            ⚠ {dupCount} duplicate{dupCount !== 1 ? "s" : ""}
-          </span>
-        )}
-        <span style={{ marginLeft: "auto", color: T.textMuted, fontSize: 11, fontWeight: 500 }}>
-          Click headers to sort · Click checkbox to mark Complete · Select 📄 checkbox to print bulks
-        </span>
-      </div>
+
 
       {/* Duplicate panel warning mapping */}
-      {dupCount > 0 && (
-        <div style={{ background: T.redBg, border: `1px solid ${T.red}44`, borderRadius: 16, padding: "14px 20px", boxShadow: "0 8px 24px rgba(0,0,0,0.03)" }}>
+      {(dupCount > 0 || otherDaysDupCount > 0) && (
+        <div style={{ background: T.amberBg, border: `1px solid ${T.amber}44`, borderRadius: 16, padding: "14px 20px", boxShadow: "0 8px 24px rgba(0,0,0,0.03)", marginBottom: 12 }}>
+          <div style={{ fontWeight: 700, color: "#b45309", fontSize: 13, marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span>⚠️ Duplicate Airway Bill (AWB) or Container ULD Collisions Detected in System:</span>
+            <span style={{ fontSize: 11, background: T.amber, color: "#ffffff", padding: "2px 8px", borderRadius: 10 }}>
+              {dupCount + otherDaysDupCount} total collisions
+            </span>
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {/* 1. CURRENT DAY DUPLICATES */}
+            {dupCount > 0 && (
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 700, color: "#4b5563", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                  📅 Duplicates on Selected Day ({toDisplay(selDate)}):
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {dayRecords
+                    .filter((r) => dupIds.has(r.id))
+                    .map((r) => (
+                      <div
+                        key={r.id}
+                        onClick={() => handleScrollToRow(r.id)}
+                        style={{
+                          fontSize: 12,
+                          color: T.textMid,
+                          background: "#ffffff",
+                          border: "1px solid #f3f4f6",
+                          borderRadius: 12,
+                          padding: "8px 14px",
+                          display: "flex",
+                          gap: 12,
+                          flexWrap: "wrap",
+                          alignItems: "center",
+                          boxShadow: "0 2px 8px rgba(0,0,0,0.02)",
+                          cursor: "pointer",
+                          transition: "all 0.15s ease-in-out",
+                        }}
+                        onMouseEnter={(e) => {
+                          e.currentTarget.style.transform = "translateY(-1px)";
+                          e.currentTarget.style.boxShadow = "0 4px 12px rgba(0,0,0,0.05)";
+                          e.currentTarget.style.borderColor = T.accent;
+                        }}
+                        onMouseLeave={(e) => {
+                          e.currentTarget.style.transform = "none";
+                          e.currentTarget.style.boxShadow = "0 2px 8px rgba(0,0,0,0.02)";
+                          e.currentTarget.style.borderColor = "#f3f4f6";
+                        }}
+                        title="Click to automatically scroll and highlight this shipment"
+                      >
+                        <strong style={{ color: "#000000" }}>{r.shipper} (Flight {r.flight})</strong>
+                        {dupDetails[r.id]?.map((d, idx) => (
+                          <div key={idx} style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "6px", fontSize: "11px" }}>
+                            <span style={{ background: T.amberBg, borderRadius: 12, padding: "3px 10px", color: "#b45309", fontWeight: 700 }}>
+                              {d.type}: <strong>{d.value}</strong>
+                            </span>
+                            <span style={{ color: "#4b5563", fontWeight: 500 }}>
+                              {d.count}× entries detected on:
+                            </span>
+                            {d.conflicts?.map((c: any, cidx: number) => (
+                              <span
+                                key={cidx}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleGoToConflict(c.id, c.date);
+                                }}
+                                style={{
+                                  background: c.date === selDate ? T.amberBg : "#f3f4f6",
+                                  border: `1px solid ${c.date === selDate ? T.amber : "#e5e7eb"}`,
+                                  borderRadius: "12px",
+                                  padding: "2px 8px",
+                                  color: "#000000",
+                                  fontWeight: 700,
+                                  fontSize: "10px",
+                                  cursor: "pointer"
+                                }}
+                                title={`Click to navigate to ${toDisplay(c.date)} and highlight this duplicate record`}
+                              >
+                                📅 {toDisplay(c.date)} ({c.flight})
+                              </span>
+                            ))}
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                </div>
+              </div>
+            )}
+
+            {/* 2. OTHER DAYS DUPLICATES SECTION */}
+            {otherDaysDupCount > 0 && (
+              <div style={{ borderTop: "1px dashed rgba(0,0,0,0.08)", paddingTop: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: "#4b5563", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                    🔄 Duplicates Found on Other Dates ({otherDaysDupCount} records):
+                  </div>
+                  <button
+                    onClick={() => setShowOtherDaysDups(!showOtherDaysDups)}
+                    style={{
+                      background: "none",
+                      border: "none",
+                      color: T.accent,
+                      fontSize: 11,
+                      fontWeight: 700,
+                      cursor: "pointer",
+                      textDecoration: "underline",
+                      padding: "2px 6px"
+                    }}
+                  >
+                    {showOtherDaysDups ? "Collapse List" : "Expand list & view all"}
+                  </button>
+                </div>
+
+                {showOtherDaysDups && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {records
+                      .filter((r) => r.date !== selDate && dupIds.has(r.id))
+                      .map((r) => (
+                        <div
+                          key={r.id}
+                          onClick={() => handleGoToConflict(r.id, r.date)}
+                          style={{
+                            fontSize: 12,
+                            color: T.textMid,
+                            background: "#ffffff",
+                            border: "1px solid #f3f4f6",
+                            borderRadius: 12,
+                            padding: "8px 14px",
+                            display: "flex",
+                            gap: 12,
+                            flexWrap: "wrap",
+                            alignItems: "center",
+                            boxShadow: "0 2px 8px rgba(0,0,0,0.02)",
+                            cursor: "pointer",
+                            transition: "all 0.15s ease-in-out",
+                          }}
+                          onMouseEnter={(e) => {
+                            e.currentTarget.style.transform = "translateY(-1px)";
+                            e.currentTarget.style.boxShadow = "0 4px 12px rgba(0,0,0,0.05)";
+                            e.currentTarget.style.borderColor = T.accent;
+                          }}
+                          onMouseLeave={(e) => {
+                            e.currentTarget.style.transform = "none";
+                            e.currentTarget.style.boxShadow = "0 2px 8px rgba(0,0,0,0.02)";
+                            e.currentTarget.style.borderColor = "#f3f4f6";
+                          }}
+                          title={`Click to automatically jump to date ${toDisplay(r.date)} and highlight this shipment`}
+                        >
+                          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{ fontSize: 10, background: "#f3f4f6", border: "1px solid #d1d5db", borderRadius: 6, padding: "2px 6px", fontWeight: "bold" }}>
+                              📅 {toDisplay(r.date)}
+                            </span>
+                            <strong style={{ color: "#000000" }}>{r.shipper} (Flight {r.flight})</strong>
+                          </div>
+                          {dupDetails[r.id]?.map((d, idx) => (
+                            <div key={idx} style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "6px", fontSize: "11px" }}>
+                              <span style={{ background: T.amberBg, borderRadius: 12, padding: "3px 10px", color: "#b45309", fontWeight: 700 }}>
+                                {d.type}: <strong>{d.value}</strong>
+                              </span>
+                              <span style={{ color: "#4b5563", fontWeight: 500 }}>
+                                {d.count}× entries detected on:
+                              </span>
+                              {d.conflicts?.map((c: any, cidx: number) => (
+                                <span
+                                  key={cidx}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleGoToConflict(c.id, c.date);
+                                  }}
+                                  style={{
+                                    background: c.date === selDate ? T.amberBg : "#f3f4f6",
+                                    border: `1px solid ${c.date === selDate ? T.amber : "#e5e7eb"}`,
+                                    borderRadius: "12px",
+                                    padding: "2px 8px",
+                                    color: "#000000",
+                                    fontWeight: 700,
+                                    fontSize: "10px",
+                                    cursor: "pointer"
+                                  }}
+                                  title={`Click to navigate to ${toDisplay(c.date)} and highlight this duplicate record`}
+                                >
+                                  📅 {toDisplay(c.date)} ({c.flight})
+                                </span>
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 2 hours prior to cutoff warning mapping */}
+      {urgentCount > 0 && (
+        <div style={{ background: T.redBg, border: `1px solid ${T.red}44`, borderRadius: 16, padding: "14px 20px", boxShadow: "0 8px 24px rgba(0,0,0,0.03)", marginBottom: 12 }}>
           <div style={{ fontWeight: 700, color: T.red, fontSize: 13, marginBottom: 8 }}>
-            ⚠️ Duplicate Airway Bill (AWB) or Container ULD Collisions Detected:
+            ⏰ 2H Cutoff Alert: {urgentCount} shipment{urgentCount !== 1 ? "s" : ""} approaching or past cutoff (within 2 hours) and NOT completed:
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {dayRecords
-              .filter((r) => dupIds.has(r.id))
+              .filter((r) => isUrgentShipment(r))
               .map((r) => (
-                <div key={r.id} style={{ fontSize: 12, color: T.textMid, background: "#ffffff", border: "1px solid #f3f4f6", borderRadius: 12, padding: "8px 14px", display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", boxShadow: "0 2px 8px rgba(0,0,0,0.02)" }}>
-                  <strong style={{ color: "#000000" }}>{r.shipper} (Flight {r.flight})</strong>
-                  {dupDetails[r.id]?.map((d, idx) => (
-                    <div key={idx} style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "6px", fontSize: "11px" }}>
-                      <span style={{ background: T.redBg, borderRadius: 12, padding: "3px 10px", color: T.red, fontWeight: 700 }}>
-                        {d.type}: <strong>{d.value}</strong>
-                      </span>
-                      <span style={{ color: "#4b5563", fontWeight: 500 }}>
-                        {d.count}× entries detected on:
-                      </span>
-                      {d.conflicts?.map((c: any, cidx: number) => (
-                        <span key={cidx} style={{ background: "#f3f4f6", border: "1px solid #e5e7eb", borderRadius: "12px", padding: "2px 8px", color: "#000000", fontWeight: 700, fontSize: "10px" }} title={`Shipper: ${c.shipper}`}>
-                          📅 {toDisplay(c.date)} ({c.flight})
-                        </span>
-                      ))}
-                    </div>
-                  ))}
+                <div
+                  key={r.id}
+                  onClick={() => handleScrollToRow(r.id)}
+                  style={{
+                    fontSize: 12,
+                    color: T.textMid,
+                    background: "#ffffff",
+                    border: "1px solid #f3f4f6",
+                    borderRadius: 12,
+                    padding: "8px 14px",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    boxShadow: "0 2px 8px rgba(0,0,0,0.02)",
+                    cursor: "pointer",
+                    transition: "all 0.15s ease-in-out",
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.transform = "translateY(-1px)";
+                    e.currentTarget.style.boxShadow = "0 4px 12px rgba(0,0,0,0.05)";
+                    e.currentTarget.style.borderColor = T.accent;
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.transform = "none";
+                    e.currentTarget.style.boxShadow = "0 2px 8px rgba(0,0,0,0.02)";
+                    e.currentTarget.style.borderColor = "#f3f4f6";
+                  }}
+                  title="Click to automatically scroll to this shipment record in the table"
+                >
+                  <div>
+                    <strong style={{ color: "#000000" }}>{r.shipper} (Flight {r.flight})</strong>
+                    <span style={{ marginLeft: 8, color: "#4b5563" }}>AWB: <strong>{r.awb || "—"}</strong></span>
+                    <span style={{ marginLeft: 8, color: "#4b5563" }}>Dest: <strong>{r.dest || "—"}</strong></span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ background: "#ef4444", color: "#ffffff", fontSize: "11px", fontWeight: 800, padding: "3px 10px", borderRadius: 12, display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                      ⏰ Cutoff: {r.cutoff}
+                    </span>
+                  </div>
                 </div>
               ))}
+          </div>
+        </div>
+      )}
+
+      {/* Flight Schedule Day Mismatch warning banner */}
+      {mismatchCount > 0 && (
+        <div
+          style={{
+            background: "#fffbeb",
+            border: "1px dashed #f59e0b",
+            color: "#b45309",
+            padding: "12px 16px",
+            borderRadius: "16px",
+            fontSize: "12.5px",
+            fontWeight: "bold",
+            marginBottom: "16px",
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            lineHeight: "1.4",
+            boxShadow: "0 1px 3px rgba(0,0,0,0.02)"
+          }}
+        >
+          <span style={{ fontSize: "16px" }}>⚠️</span>
+          <div>
+            <strong>Flight Day Schedule Conflict Alert:</strong> There are <strong>{mismatchCount} shipment(s)</strong> listed on this manifest page that fall on a day of the week with no scheduled operations. Check indicator badges in list below.
           </div>
         </div>
       )}
@@ -1183,13 +1456,7 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
                 {TH("scr", "SCR", 44)}
                 {TH("loadType", "LOAD TYPE", 100)}
                 {TH("operator", "OPERATOR", 88)}
-                <th style={{ padding: "9px 8px", color: "#000000", fontSize: 9, background: T.surface, borderBottom: `2px solid ${T.border}`, whiteSpace: "nowrap", width: 100, textAlign: "center" }}>
-                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
-                    <input type="checkbox" checked={allSelected} onChange={toggleSelectAll} style={{ width: 14, height: 14, cursor: "pointer", accentColor: "#b45309" }} title="Select all columns" />
-                    <span style={{ fontSize: 8, color: "#000000", fontWeight: 700 }}>📄 JOB SHEET PRINT</span>
-                  </div>
-                </th>
-                <th style={{ padding: "9px 10px", color: "#000000", fontSize: 10, background: T.surface, borderBottom: `2px solid ${T.border}`, whiteSpace: "nowrap", width: 120 }}>Actions</th>
+                <th style={{ padding: "9px 10px", color: "#000000", fontSize: 10, background: T.surface, borderBottom: `2px solid ${T.border}`, whiteSpace: "nowrap", width: 250 }}>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -1197,22 +1464,51 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
                 const isComplete = !!row.complete;
                 const isDup = dupIds.has(row.id);
                 const isJobSelected = selectedJobs.has(row.id);
+                const mismatchInfo = !isComplete ? getDayMismatchInfo(row.flight, row.date) : null;
+                const isConfirmingDelete = !!row.confirmDelete;
+                const isSuredDelete = !!row.deleteSured;
+                const isDeleting = !!row.isDeleted;
+                const isDeletedOrSured = isDeleting || isSuredDelete;
+                const isUrgent = isUrgentShipment(row);
 
                 let rowBg = i % 2 === 0 ? T.surface : T.surface2;
-                if (isComplete) rowBg = "#f0fdf4";
-                if (isDup && !isComplete) rowBg = "#fff7ed";
-                if (isJobSelected) rowBg = "#fffbeb";
+                if (row.id === highlightedRowId) rowBg = "#fde047"; // High-visibility bright yellow-300 highlight
+                else if (isComplete) rowBg = "#d1fae5";
+                else if (isUrgent) rowBg = "#fee2e2";
+                else if (isDup && !isComplete) rowBg = "#fff7ed";
+                else if (mismatchInfo) rowBg = "#fffdf5";
+                else if (isJobSelected) rowBg = "#fffbeb";
+                if (isDeletedOrSured && row.id !== highlightedRowId) rowBg = "#000000"; // Black background for the marked/delete stage
 
-                const hoverBg = isComplete ? "#dcfce7" : isDup ? "#ffedd5" : isJobSelected ? "#fef9c3" : T.accentBg;
+                const hoverBg = isDeletedOrSured && row.id !== highlightedRowId
+                  ? "#18181b" 
+                  : (row.id === highlightedRowId
+                      ? "#facc15" // Hover yellow-400
+                      : (isConfirmingDelete
+                          ? "#fee2e2"
+                          : (isComplete 
+                              ? "#b1f2d2" 
+                              : isUrgent 
+                                ? "#fca5a5" 
+                                : isDup 
+                                  ? "#ffedd5" 
+                                  : mismatchInfo 
+                                    ? "#fffbeb" 
+                                    : isJobSelected 
+                                      ? "#fef9c3" 
+                                      : T.accentBg)));
 
                 return (
                   <tr
+                    id={"shipment-row-" + row.id}
                     key={row.id}
                     style={{
-                      borderBottom: `1px solid ${isComplete ? "#bbf7d0" : isDup ? "#fed7aa" : isJobSelected ? "#fde68a" : T.border}`,
+                      borderBottom: `1px solid ${row.id === highlightedRowId ? "#eab308" : (isDeletedOrSured ? "#3f3f46" : (isComplete ? "#bbf7d0" : isUrgent ? "#fca5a5" : isDup ? "#fed7aa" : mismatchInfo ? "#fef3c7" : isJobSelected ? "#fde68a" : T.border))}`,
                       background: rowBg,
-                      transition: "background 0.1s",
+                      transition: "background 0.4s ease, border-color 0.4s ease",
                       opacity: isComplete ? 0.75 : 1,
+                      outline: row.id === highlightedRowId ? "3px solid #eab308" : "none",
+                      outlineOffset: "-3px",
                     }}
                     onMouseEnter={(e) => (e.currentTarget.style.background = hoverBg)}
                     onMouseLeave={(e) => (e.currentTarget.style.background = rowBg)}
@@ -1229,33 +1525,127 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
                     </td>
 
                     {/* CUTOFF */}
-                    <td style={{ padding: "8px 10px", color: "#000000", fontFamily: "monospace", fontWeight: 800, fontSize: 13, whiteSpace: "nowrap", textDecoration: isComplete ? "line-through" : "none" }}>
+                    <td style={{ 
+                      padding: "8px 10px", 
+                      color: isDeletedOrSured ? "#ffffff" : isComplete ? "#166534" : isUrgent ? "#991b1b" : "#000000", 
+                      fontFamily: "monospace", 
+                      fontWeight: 800, 
+                      fontSize: 13, 
+                      whiteSpace: "nowrap", 
+                      textDecoration: isComplete ? "line-through" : "none" 
+                    }}>
                       {row.cutoff || "—"}
+                      {isUrgent && (
+                        <span 
+                          style={{ 
+                            marginLeft: 6, 
+                            fontSize: 9, 
+                            background: "#ef4444", 
+                            color: "#ffffff", 
+                            padding: "2px 5px", 
+                            borderRadius: 4, 
+                            fontWeight: 800,
+                            display: "inline-flex",
+                            alignItems: "center"
+                          }}
+                          title="Within 2 hours of flight cutoff!"
+                        >
+                          ⚠️ 2H CUTOFF
+                        </span>
+                      )}
                     </td>
 
                     {/* AWB */}
                     <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
                       {isDup ? (
-                        <span style={{ background: "#fff7ed", border: "1px solid #f97316", borderRadius: 4, padding: "2px 8px", color: "#000000", fontWeight: 800, display: "inline-flex", alignItems: "center", gap: 4, fontSize: 14, fontFamily: "monospace" }} title="Duplicate collision alerts screen. Check logs.">
+                        <span style={{ background: isDeletedOrSured ? "#18181b" : "#fff7ed", border: isDeletedOrSured ? "1px solid #71717a" : "1px solid #f97316", borderRadius: 4, padding: "2px 8px", color: isDeletedOrSured ? "#ffffff" : (isComplete ? "#166534" : "#000000"), fontWeight: 800, display: "inline-flex", alignItems: "center", gap: 4, fontSize: 14, fontFamily: "monospace", textDecoration: isComplete ? "line-through" : "none" }} title="Duplicate collision alerts screen. Check logs.">
                           ⚠ {row.awb}
                         </span>
                       ) : (
-                        <span style={{ color: "#000000", fontSize: 14, fontWeight: 800, fontFamily: "monospace" }}>{row.awb}</span>
+                        <span style={{ color: isDeletedOrSured ? "#ffffff" : (isComplete ? "#166534" : "#000000"), fontSize: 14, fontWeight: 800, fontFamily: "monospace", textDecoration: isComplete ? "line-through" : "none" }}>{row.awb}</span>
                       )}
                     </td>
 
                     {/* FLIGHT */}
                     <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
-                      <Pill text={row.flight} color={T.accent} />
+                      <span style={{ textDecoration: isComplete ? "line-through" : "none", display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                        <span
+                          onClick={() => onGoToFlightSchedule?.(row.flight)}
+                          style={{ cursor: onGoToFlightSchedule ? "pointer" : "default" }}
+                          title={onGoToFlightSchedule ? "Click to view flight details in Flight Admin" : undefined}
+                        >
+                          <Pill text={row.flight} color={isComplete ? "#16a34a" : (isDeletedOrSured ? "#27272a" : T.accent)} textColor={isDeletedOrSured ? "#ffffff" : undefined} />
+                        </span>
+                        {mismatchInfo && (
+                          <span 
+                            onClick={() => onGoToFlightSchedule?.(row.flight)}
+                            style={{ 
+                              background: "#fff9db", 
+                              border: "1px dashed #f59e0b", 
+                              borderRadius: 4, 
+                              padding: "2px 4px", 
+                              color: "#b45309", 
+                              fontWeight: 800, 
+                              fontSize: "9px", 
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: "2px",
+                              cursor: onGoToFlightSchedule ? "pointer" : "help",
+                              transition: "all 0.1s ease"
+                            }}
+                            title={`No flight scheduled for ${row.flight} on ${mismatchInfo.dayName} (${mismatchInfo.daysConfig}). Click to view or edit schedule.`}
+                            onMouseEnter={(e) => {
+                              e.currentTarget.style.background = "#fee2e2";
+                              e.currentTarget.style.borderColor = "#ef4444";
+                              e.currentTarget.style.color = "#991b1b";
+                            }}
+                            onMouseLeave={(e) => {
+                              e.currentTarget.style.background = "#fff9db";
+                              e.currentTarget.style.borderColor = "#f59e0b";
+                              e.currentTarget.style.color = "#b45309";
+                            }}
+                          >
+                            ⚠️ No Sched
+                          </span>
+                        )}
+                        <span 
+                          onClick={() => setSelectedAirlineFlight(row.flight)}
+                          style={{ 
+                            background: "#e0f2fe", 
+                            border: "1px solid #bae6fd", 
+                            borderRadius: 4, 
+                            padding: "2px 5px", 
+                            color: "#0369a1", 
+                            fontWeight: 800, 
+                            fontSize: "9px", 
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "2.5px",
+                            cursor: "pointer",
+                            transition: "all 0.1s ease"
+                          }}
+                          title="Click to view Saved Airline & Booking Information"
+                          onMouseEnter={(e) => {
+                            e.currentTarget.style.background = "#bae6fd";
+                            e.currentTarget.style.borderColor = "#0284c7";
+                          }}
+                          onMouseLeave={(e) => {
+                            e.currentTarget.style.background = "#e0f2fe";
+                            e.currentTarget.style.borderColor = "#bae6fd";
+                          }}
+                        >
+                          ✈️ Info
+                        </span>
+                      </span>
                     </td>
 
                     {/* CLIENT */}
                     <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
-                      <span style={{ background: "#f5f5f7", color: "#000000", border: "1px solid #d2d2d7", borderRadius: 4, padding: "2px 7px", fontSize: 11, fontWeight: 700, whiteSpace: "nowrap" }}>SEAWAY</span>
+                      <span style={{ background: isDeletedOrSured ? "#18181b" : "#f5f5f7", color: isDeletedOrSured ? "#ffffff" : (isComplete ? "#166534" : "#000000"), border: isDeletedOrSured ? "1px solid #52525b" : "1px solid #d2d2d7", borderRadius: 4, padding: "2px 7px", fontSize: 11, fontWeight: 700, whiteSpace: "nowrap", textDecoration: isComplete ? "line-through" : "none" }}>SEAWAY</span>
                     </td>
 
                     {/* SHIPPER */}
-                    <td style={{ padding: "8px 10px", color: "#000000", fontWeight: 600, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: isComplete ? "line-through" : "none" }}>
+                    <td style={{ padding: "8px 10px", color: isDeletedOrSured ? "#ffffff" : (isComplete ? "#166534" : "#000000"), fontWeight: 600, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: isComplete ? "line-through" : "none" }}>
                       {row.shipper}
                     </td>
 
@@ -1277,92 +1667,117 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
                         style={{
                           width: "100%",
                           resize: "none",
-                          background: dupDetails[row.id]?.some((d) => d.type === "ULD") ? "#fff7ed" : "#ffffff",
-                          border: dupDetails[row.id]?.some((d) => d.type === "ULD") ? "1.5px solid #f97316" : "1px solid #cbd5e1",
+                          background: isDeletedOrSured ? "#111111" : (dupDetails[row.id]?.some((d) => d.type === "ULD") ? "#fff7ed" : isComplete ? "#d1fae5" : "#ffffff"),
+                          border: isDeletedOrSured ? "1.5px solid #52525b" : (dupDetails[row.id]?.some((d) => d.type === "ULD") ? "1.5px solid #f97316" : isComplete ? "1px solid #a7f3d0" : "1px solid #cbd5e1"),
                           borderRadius: 4,
                           padding: "6px 6px",
                           fontSize: 11,
-                          color: dupDetails[row.id]?.some((d) => d.type === "ULD") ? "#b45309" : "#000000",
+                          color: isDeletedOrSured ? "#ffffff" : (dupDetails[row.id]?.some((d) => d.type === "ULD") ? "#b45309" : isComplete ? "#166534" : "#000000"),
                           fontFamily: "monospace",
-                          fontWeight: 850,
+                          fontWeight: 855,
                           outline: "none",
                           whiteSpace: "pre-wrap",
                           wordBreak: "break-all",
                           overflowWrap: "anywhere",
                           overflow: "hidden",
                           lineHeight: "1.3",
+                          textDecoration: isComplete ? "line-through" : "none",
                         }}
                       />
                     </td>
 
                     {/* DEST */}
-                    <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
-                      <span style={{ fontWeight: 800, color: "#000000", fontSize: 13 }}>{row.dest || "—"}</span>
+                    <td style={{ padding: "8px 10px", whiteSpace: "nowrap", textDecoration: isComplete ? "line-through" : "none" }}>
+                      <span style={{ fontWeight: 800, color: isDeletedOrSured ? "#ffffff" : (isComplete ? "#166534" : "#000000"), fontSize: 13 }}>{row.dest || "—"}</span>
                     </td>
 
                     {/* DRY ICE */}
-                    <td style={{ padding: "8px 10px", color: "#000000", fontSize: 11, whiteSpace: "nowrap" }}>
+                    <td style={{ padding: "8px 10px", color: isDeletedOrSured ? "#ffffff" : (isComplete ? "#166534" : "#000000"), fontSize: 11, whiteSpace: "nowrap", textDecoration: isComplete ? "line-through" : "none" }}>
                       {row.ice && row.ice.trim() ? row.ice : "N/A"}
                     </td>
 
                     {/* CTO */}
-                    <td style={{ padding: "8px 10px", color: "#000000", fontSize: 11, whiteSpace: "nowrap" }}>
+                    <td style={{ padding: "8px 10px", color: isDeletedOrSured ? "#ffffff" : (isComplete ? "#166534" : "#000000"), fontSize: 11, whiteSpace: "nowrap", textDecoration: isComplete ? "line-through" : "none" }}>
                       {row.cto || "—"}
                     </td>
 
                     {/* COMMODITY */}
                     <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
-                      <Pill text={row.commodity} color={cCol(row.commodity)} />
+                      <span style={{ textDecoration: isComplete ? "line-through" : "none", display: "inline-block" }}>
+                        <Pill text={row.commodity} color={isComplete ? "#16a34a" : isDeletedOrSured ? "#27272a" : cCol(row.commodity)} textColor={isDeletedOrSured ? "#ffffff" : undefined} />
+                      </span>
                     </td>
 
                     {/* INSTRUCTIONS */}
-                    <td style={{ padding: "8px 10px", color: "#000000", fontSize: 11, minWidth: 160, whiteSpace: "normal", wordBreak: "break-word" }} title={row.specialInst}>
+                    <td style={{ padding: "8px 10px", color: isDeletedOrSured ? "#e2e8f0" : (isComplete ? "#166534" : "#000000"), fontSize: 11, minWidth: 160, whiteSpace: "normal", wordBreak: "break-word", textDecoration: isComplete ? "line-through" : "none" }} title={row.specialInst}>
                       {row.specialInst || "—"}
                     </td>
 
                     {/* SCR */}
-                    <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
-                      <span style={{ fontWeight: 700, color: "#000000" }}>
+                    <td style={{ padding: "8px 10px", whiteSpace: "nowrap", textDecoration: isComplete ? "line-through" : "none" }}>
+                      <span style={{ fontWeight: 700, color: isDeletedOrSured ? "#ffffff" : (isComplete ? "#166534" : "#000000") }}>
                         {row.scr || "—"}
                       </span>
                     </td>
 
-                    {/* LOAD TYPE (editable inline input - e.g. UNIT or LOOSE) */}
+                    {/* LOAD TYPE (manually toggleable pill button) */}
                     <td style={{ padding: "4px 8px", whiteSpace: "nowrap", width: 100 }}>
+                      <button
+                        onClick={() => {
+                          const nextType = (row.loadType || "UNIT").toUpperCase() === "LOOSE" ? "UNIT" : "LOOSE";
+                          const sched = schedule[row.flight.toUpperCase()];
+                          let nextCutoff = row.cutoff;
+                          if (sched && sched.cutoff) {
+                            nextCutoff = nextType === "LOOSE" ? (subtractHour(sched.cutoff) || sched.cutoff) : sched.cutoff;
+                          }
+                          onUpdate?.(row.id, { loadType: nextType, cutoff: nextCutoff });
+                        }}
+                        title="Click to toggle between UNIT and LOOSE"
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          width: "100%",
+                          padding: "5px 8px",
+                          fontSize: "11px",
+                          fontWeight: 855,
+                          fontFamily: "inherit",
+                          borderRadius: "20px", // capsule pill button
+                          cursor: "pointer",
+                          transition: "all 0.1s ease",
+                          textDecoration: isComplete ? "line-through" : "none",
+                          border: "none",
+                          background: (row.loadType || "UNIT").toUpperCase() === "LOOSE" ? "#fee2e2" : "#dbeafe",
+                          color: (row.loadType || "UNIT").toUpperCase() === "LOOSE" ? "#991b1b" : "#1e40af",
+                          boxShadow: "0 1px 2px rgba(0,0,0,0.05)"
+                        }}
+                      >
+                        {(row.loadType || "UNIT").toUpperCase()}
+                      </button>
+                    </td>
+
+                    {/* OPERATOR (editable inline input) */}
+                    <td style={{ padding: "4px 8px", whiteSpace: "nowrap", width: 110 }}>
                       <input
                         type="text"
-                        value={row.loadType || ""}
-                        onChange={(e) => onUpdate?.(row.id, { loadType: e.target.value.toUpperCase() })}
-                        title="Load Type (UNIT / LOOSE). Click to edit/adjust"
+                        value={row.operator || ""}
+                        onChange={(e) => onUpdate?.(row.id, { operator: e.target.value.toUpperCase() })}
+                        placeholder="—"
+                        title="Operator. Click to edit/adjust"
                         style={{
                           width: "100%",
-                          background: "#ffffff",
-                          border: "1px solid #d2d2d7",
+                          background: isDeletedOrSured ? "#111111" : (isComplete ? "#d1fae5" : "#ffffff"),
+                          border: isDeletedOrSured ? "1.5px solid #52525b" : (isComplete ? "1px solid #a7f3d0" : "1px solid #d2d2d7"),
                           borderRadius: 4,
                           padding: "4px 8px",
                           fontSize: 11,
-                          color: "#000000",
+                          color: isDeletedOrSured ? "#ffffff" : (isComplete ? "#166534" : "#000000"),
                           fontFamily: "monospace",
                           fontWeight: 800,
                           outline: "none",
                           textAlign: "center",
+                          textDecoration: isComplete ? "line-through" : "none",
                         }}
-                      />
-                    </td>
-
-                    {/* OPERATOR */}
-                    <td style={{ padding: "8px 10px", color: "#000000", fontSize: 11, whiteSpace: "nowrap" }}>
-                      {row.operator || "—"}
-                    </td>
-
-                    {/* JOB SELECT CHECKBOX */}
-                    <td style={{ padding: "8px 6px", textAlign: "center" }}>
-                      <input
-                        type="checkbox"
-                        checked={isJobSelected}
-                        onChange={() => toggleJobSelect(row.id)}
-                        style={{ width: 15, height: 15, cursor: "pointer", accentColor: "#b45309" }}
-                        title="Tick Job Sheet to bulk print"
                       />
                     </td>
 
@@ -1372,7 +1787,13 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
                         <button onClick={() => onJobSheet(row)} title="Open Job Sheet editor" style={{ background: "#fef3c7", border: "1px solid #fde68a", color: "#000000", borderRadius: 4, padding: "3px 6px", cursor: "pointer", fontSize: 10, fontWeight: 700, whiteSpace: "nowrap" }}>📄 Job</button>
                         <button onClick={() => onLoadsheet(row)} title="Open Load Out Sheet editor" style={{ background: T.greenBg, border: `1px solid #bbf7d0`, color: "#000000", borderRadius: 4, padding: "3px 6px", cursor: "pointer", fontSize: 10, fontWeight: 700, whiteSpace: "nowrap" }}>📋 Load</button>
                         <button onClick={() => onEdit(row)} style={{ background: T.accentBg, border: `1px solid #bfdbfe`, color: "#000000", borderRadius: 4, padding: "3px 6px", cursor: "pointer", fontSize: 11, whiteSpace: "nowrap" }}>Edit</button>
-                        <DeleteButton id={row.id} onDelete={onDelete} />
+                        <DeleteButton
+                          id={row.id}
+                          onDelete={onDelete}
+                          onUpdate={onUpdate}
+                          confirmDelete={row.confirmDelete}
+                          deleteSured={row.deleteSured}
+                        />
                       </div>
                     </td>
                   </tr>
@@ -1388,219 +1809,13 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
         </div>
       </div>
 
-      {/* SOP & FAQ Operations Instruction Manual Panel */}
-      <div
-        id="sop-operations-manual"
-        style={{
-          background: "#ffffff",
-          border: "1px solid #e2e8f0",
-          borderRadius: 20,
-          boxShadow: "0 4px 20px rgba(0,0,0,0.02)",
-          overflow: "hidden",
-          marginTop: 12,
-          transition: "all 0.2s ease-in-out",
-        }}
-      >
-        <button
-          onClick={() => setShowSopGuide(!showSopGuide)}
-          style={{
-            width: "100%",
-            background: "linear-gradient(to right, #f8fafc, #ffffff)",
-            border: "none",
-            outline: "none",
-            padding: "16px 20px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            cursor: "pointer",
-            textAlign: "left",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={{
-              background: T.accentBg,
-              color: T.accent,
-              borderRadius: "50%",
-              width: 32,
-              height: 32,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center"
-            }}>
-              <BookOpen size={16} />
-            </div>
-            <div>
-              <h3 style={{ margin: 0, fontSize: 13, fontWeight: 750, color: T.text, display: "flex", alignItems: "center", gap: 8 }}>
-                Operations Standard Operating Procedures (SOP) & FAQs
-                <span style={{
-                  background: "#fee2e2",
-                  color: "#991b1b",
-                  fontSize: 10,
-                  fontWeight: 700,
-                  padding: "2px 8px",
-                  borderRadius: 12,
-                  letterSpacing: "0.03em"
-                }}>
-                  ACTIVE PROTOCOL
-                </span>
-              </h3>
-              <p style={{ margin: "2px 0 0 0", fontSize: 11, color: T.textMuted }}>
-                Reference guide for manifest validation, cold-chain temperature cutoff control, and active ULD container handling standards.
-              </p>
-            </div>
-          </div>
-          <div style={{ color: T.textMuted }}>
-            {showSopGuide ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
-          </div>
-        </button>
-
-        {showSopGuide && (
-          <div style={{ borderTop: "1px solid #f1f5f9", padding: "20px 24px" }}>
-            {/* Header Tabs inside Manual Panel */}
-            <div style={{ display: "flex", gap: 8, borderBottom: "1px solid #e2e8f0", paddingBottom: 12, marginBottom: 16 }}>
-              <button
-                onClick={() => setSopSubTab("sop")}
-                style={{
-                  background: sopSubTab === "sop" ? T.accentBg : "transparent",
-                  border: "none",
-                  color: sopSubTab === "sop" ? T.accent : T.textMid,
-                  fontWeight: 700,
-                  fontSize: 12,
-                  padding: "6px 16px",
-                  borderRadius: 10,
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                  transition: "all 0.15s"
-                }}
-              >
-                <BookOpen size={14} />
-                <span>Standard Operating Procedures (SOP)</span>
-              </button>
-              <button
-                onClick={() => setSopSubTab("faq")}
-                style={{
-                  background: sopSubTab === "faq" ? T.accentBg : "transparent",
-                  border: "none",
-                  color: sopSubTab === "faq" ? T.accent : T.textMid,
-                  fontWeight: 700,
-                  fontSize: 12,
-                  padding: "6px 16px",
-                  borderRadius: 10,
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                  transition: "all 0.15s"
-                }}
-              >
-                <HelpCircle size={14} />
-                <span>Frequently Asked Questions (FAQ)</span>
-              </button>
-            </div>
-
-            {/* Panel Tab Sub-View */}
-            {sopSubTab === "sop" ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-                {/* SOP Grid of 4 Core Phases */}
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16 }}>
-                  {/* Step 1 */}
-                  <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 12, padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <span style={{ fontSize: 10, fontWeight: 800, color: T.accent, textTransform: "uppercase", letterSpacing: "0.05em" }}>Phase 01</span>
-                      <span style={{ fontSize: 10, fontWeight: 700, color: "#1e293b", background: "#e2e8f0", padding: "2px 6px", borderRadius: 4 }}>INTAKE</span>
-                    </div>
-                    <h4 style={{ margin: 0, fontSize: 13, fontWeight: 700, color: T.text }}>Manifest & AWB Validation</h4>
-                    <p style={{ margin: 0, fontSize: 11.5, color: T.textMid, lineHeight: "1.5" }}>
-                      Each entry must have a valid Air Waybill (AWB) format (typically 3 digits - 8 hyphenated digits). Check for duplicate serials inside the daily ledger to prevent cross-booking conflicts. Correct the Shipper context to guarantee correct customs reporting upon departure.
-                    </p>
-                  </div>
-
-                  {/* Step 2 */}
-                  <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 12, padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <span style={{ fontSize: 10, fontWeight: 800, color: T.accent, textTransform: "uppercase", letterSpacing: "0.05em" }}>Phase 02</span>
-                      <span style={{ fontSize: 10, fontWeight: 700, color: "#9a3412", background: "#ffedd5", padding: "2px 6px", borderRadius: 4 }}>COLD CHAIN</span>
-                    </div>
-                    <h4 style={{ margin: 0, fontSize: 13, fontWeight: 700, color: T.text }}>Dry Ice & Temp Controls</h4>
-                    <p style={{ margin: 0, fontSize: 11.5, color: T.textMid, lineHeight: "1.5" }}>
-                      For thermo-sensitive or high-risk shipments, input the exact Dry Ice weight in the <code style={{fontFamily:"monospace", color:"#9a3412", fontWeight:700}}>ICE (KG)</code> field. The cutoff window is automatically checked against the active carrier schedules; verify the <code style={{fontFamily:"monospace", color:"#1e40af", fontWeight:700}}>Cutoff Time</code> to avoid warm cargo tarmac exposure.
-                    </p>
-                  </div>
-
-                  {/* Step 3 */}
-                  <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 12, padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <span style={{ fontSize: 10, fontWeight: 800, color: T.accent, textTransform: "uppercase", letterSpacing: "0.05em" }}>Phase 03</span>
-                      <span style={{ fontSize: 10, fontWeight: 700, color: "#166534", background: "#dcfce7", padding: "2px 6px", borderRadius: 4 }}>U.L.D.</span>
-                    </div>
-                    <h4 style={{ margin: 0, fontSize: 13, fontWeight: 700, color: T.text }}>Load Sheet Planning</h4>
-                    <p style={{ margin: 0, fontSize: 11.5, color: T.textMid, lineHeight: "1.5" }}>
-                      Click <code style={{fontFamily:"monospace", color:"#15803d", fontWeight:705}}>📋 Load</code> to configure the Load Out document. Double check that the container prefix matches standard configurations (e.g. AKE, PMC, ALF) and map out active cargo weight distributions. Ensure the load type is designated as <strong style={{fontWeight:700}}>UNIT</strong> or <strong style={{fontWeight:700}}>LOOSE</strong>.
-                    </p>
-                  </div>
-
-                  {/* Step 4 */}
-                  <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 12, padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <span style={{ fontSize: 10, fontWeight: 800, color: T.accent, textTransform: "uppercase", letterSpacing: "0.05em" }}>Phase 04</span>
-                      <span style={{ fontSize: 10, fontWeight: 700, color: "#0f172a", background: "#f1f5f9", padding: "2px 6px", borderRadius: 4 }}>DISPATCH</span>
-                    </div>
-                    <h4 style={{ margin: 0, fontSize: 13, fontWeight: 700, color: T.text }}>Dispersal & Operations Sync</h4>
-                    <p style={{ margin: 0, fontSize: 11.5, color: T.textMid, lineHeight: "1.5" }}>
-                      Track completion checkboxes on loaded flights. Generate single-row job records with the <code style={{fontFamily:"monospace", color:"#b45309", fontWeight:700}}>📄 Job</code> action. At shift-end, run a full <code style={{fontFamily:"monospace", color:T.accent, fontWeight:700}}>Export to Excel</code> payload backup to ensure historical records remain secure.
-                    </p>
-                  </div>
-                </div>
-
-                {/* Checklist Footer Note */}
-                <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 12, padding: "12px 16px", display: "flex", gap: 10, alignItems: "start" }}>
-                  <Info size={16} style={{ color: "#2563eb", marginTop: 2, flexShrink: 0 }} />
-                  <div>
-                    <strong style={{ fontSize: 12, color: "#1e3a8a", display: "block" }}>Protip: Multi-device Live Sync</strong>
-                    <span style={{ fontSize: 11, color: "#1e40af", lineHeight: "1.4" }}>
-                      Because the platform operates on an active Cloud Core Database, multiple dispatchers can open the workspace links in separate tabs or devices. Updates to checkboxes, load sheets, and flight times occur securely in real-time. Keep the network status bar green for automatic syncing.
-                    </span>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-                {/* Q1 */}
-                <div style={{ borderBottom: "1px solid #f1f5f9", paddingBottom: 14 }}>
-                  <h4 style={{ margin: 0, fontSize: 12.5, fontWeight: 700, color: T.text }}>
-                    Q: What does the Red Conflict Badge denote next to an Air Waybill or ULD?
-                  </h4>
-                  <p style={{ margin: "6px 0 0 0", fontSize: 11.5, color: T.textMid, lineHeight: "1.4" }}>
-                    When multiple cargo logs on the same operations manifest are assigned identical AWB numbers or individual high-fidelity container numbers (e.g., PMC12345QF), the system highlights them automatically. This acts as a safe dispatcher guard to prevent double-loading container numbers or placing overlapping labels on cargo routes.
-                  </p>
-                </div>
-
-                {/* Q3 */}
-                <div style={{ borderBottom: "1px solid #f1f5f9", paddingBottom: 14 }}>
-                  <h4 style={{ margin: 0, fontSize: 12.5, fontWeight: 700, color: T.text }}>
-                    Q: How is the cutoff time checked against airline schedules?
-                  </h4>
-                  <p style={{ margin: "6px 0 0 0", fontSize: 11.5, color: T.textMid, lineHeight: "1.4" }}>
-                    The application matches the shipment's flight number against active timetables configured in the <strong>Flight Schedules</strong> manager tab. If the current cutoff meets or exceeds standard thresholds, it lights up correctly. You can edit carrier timetables in the manager tab to keep operational thresholds up-to-date.
-                  </p>
-                </div>
-
-                {/* Q4 */}
-                <div style={{ borderBottom: "1px solid #f1f5f9", paddingBottom: 14 }}>
-                  <h4 style={{ margin: 0, fontSize: 12.5, fontWeight: 700, color: T.text }}>
-                    Q: What happens if our terminal database loses internet connectivity?
-                  </h4>
-                  <p style={{ margin: "6px 0 0 0", fontSize: 11.5, color: T.textMid, lineHeight: "1.4" }}>
-                    The UI remains fully functional! The loadsheet and manifest engine gracefully fall back to local browser state storage. Once connection to the Cloud database is restored or the user hits the reconnect anchor, updates are synced safely with zero data loss.
-                  </p>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
+      <AirlineInfoModal
+        isOpen={selectedAirlineFlight !== null}
+        flightCode={selectedAirlineFlight}
+        schedule={schedule}
+        onClose={() => setSelectedAirlineFlight(null)}
+        onGoToFlightSchedule={onGoToFlightSchedule}
+      />
     </div>
   );
 };

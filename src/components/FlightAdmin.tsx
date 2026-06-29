@@ -4,7 +4,8 @@
  */
 
 import React, { useState, useMemo, useRef } from "react";
-import { Download, Upload, Search } from "lucide-react";
+import { Download, Upload, Search, Mail, Phone, Info, ChevronDown, ChevronUp, FileText, Globe } from "lucide-react";
+import * as XLSX from "xlsx";
 import { FlightSchedule, FlightInfo } from "../types";
 import { T, INP, SEL } from "../utils/theme";
 import { DEFAULT_SCHEDULE } from "../data/mockData";
@@ -13,6 +14,8 @@ import { getAvailableCtos, getAirlineForFlight } from "../utils/helpers";
 interface FlightAdminProps {
   schedule: FlightSchedule;
   onChange: (updatedSchedule: FlightSchedule) => void;
+  highlightFlight?: string | null;
+  onClearHighlightFlight?: () => void;
 }
 
 interface RowData extends FlightInfo {
@@ -20,16 +23,65 @@ interface RowData extends FlightInfo {
   airline: string;
 }
 
-export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) => {
+export const convertNumericDaysToMTWTFSS = (daysStr: string): string => {
+  const trimmed = daysStr.trim();
+  if (!trimmed) return ".......";
+
+  // If the input has any digits from 1 to 7, convert it to MTWTFSS pattern
+  if (/[1-7]/.test(trimmed)) {
+    const template = [".", ".", ".", ".", ".", ".", "."];
+    const mappings: { [key: string]: { char: string; idx: number } } = {
+      "1": { char: "M", idx: 0 },
+      "2": { char: "T", idx: 1 },
+      "3": { char: "W", idx: 2 },
+      "4": { char: "T", idx: 3 },
+      "5": { char: "F", idx: 4 },
+      "6": { char: "S", idx: 5 },
+      "7": { char: "S", idx: 6 },
+    };
+
+    for (let i = 0; i < trimmed.length; i++) {
+      const ch = trimmed[i];
+      if (mappings[ch]) {
+        template[mappings[ch].idx] = mappings[ch].char;
+      }
+    }
+    return template.join("");
+  }
+
+  if (trimmed.toUpperCase() === "DAILY") {
+    return "MTWTFSS";
+  }
+
+  return trimmed.toUpperCase();
+};
+
+export const FlightAdmin: React.FC<FlightAdminProps> = ({
+  schedule,
+  onChange,
+  highlightFlight,
+  onClearHighlightFlight,
+}) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [expandedFlights, setExpandedFlights] = useState<Record<string, boolean>>({});
+
+  const toggleExpand = (f: string) => {
+    setExpandedFlights((prev) => ({ ...prev, [f]: !prev[f] }));
+  };
+
   const [rows, setRows] = useState<RowData[]>(() =>
     Object.entries(schedule).map(([flight, v]) => {
       const info = v as FlightInfo;
       return {
         flight,
         ...info,
+        origin: info.origin || "MEL",
         airline: info.airline || getAirlineForFlight(flight),
         days: info.days || "",
+        emailContacts: info.emailContacts || "",
+        contactPhone: info.contactPhone || "",
+        bookingPortal: info.bookingPortal || "",
+        bookingNotes: info.bookingNotes || "",
       };
     })
   );
@@ -38,12 +90,31 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
   const [editForm, setEditForm] = useState<RowData | null>(null);
   const [confirmDeleteFlight, setConfirmDeleteFlight] = useState<string | null>(null);
 
+  React.useEffect(() => {
+    setRows(
+      Object.entries(schedule).map(([flight, v]) => {
+        const info = v as FlightInfo;
+        return {
+          flight,
+          ...info,
+          origin: info.origin || "MEL",
+          airline: info.airline || getAirlineForFlight(flight),
+          days: info.days || "",
+          emailContacts: info.emailContacts || "",
+          contactPhone: info.contactPhone || "",
+          bookingPortal: info.bookingPortal || "",
+          bookingNotes: info.bookingNotes || "",
+        };
+      })
+    );
+  }, [schedule]);
+
   // Sorting and Row Hovering States
-  const [sortField, setSortField] = useState<"flight" | "dest" | "cto" | "airline" | "days" | null>(null);
+  const [sortField, setSortField] = useState<"flight" | "origin" | "dest" | "cto" | "airline" | "days" | null>(null);
   const [sortAsc, setSortAsc] = useState<boolean>(true);
   const [hoveredRow, setHoveredRow] = useState<string | null>(null);
 
-  const handleSort = (field: "flight" | "dest" | "cto" | "airline" | "days") => {
+  const handleSort = (field: "flight" | "origin" | "dest" | "cto" | "airline" | "days") => {
     if (sortField === field) {
       setSortAsc(!sortAsc);
     } else {
@@ -52,7 +123,7 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
     }
   };
 
-  const renderSortIndicator = (field: "flight" | "dest" | "cto" | "airline" | "days") => {
+  const renderSortIndicator = (field: "flight" | "origin" | "dest" | "cto" | "airline" | "days") => {
     if (sortField === field) {
       return (
           <span style={{ color: T.accent, marginLeft: 4, fontWeight: "bold" }}>
@@ -86,7 +157,7 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
     const q = search.toLowerCase();
     let list = q
       ? rows.filter((r) =>
-          [r.airline || "", r.flight, r.days || "", r.dest, r.cto, r.cutoff, r.etd, r.eta]
+          [r.airline || "", r.flight, r.days || "", r.origin || "", r.dest, r.cto, r.cutoff, r.etd, r.eta, r.emailContacts || "", r.contactPhone || "", r.bookingPortal || "", r.bookingNotes || ""]
             .join(" ")
             .toLowerCase()
             .includes(q)
@@ -108,7 +179,20 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
   const openEdit = (r: RowData) => {
     setEditRow(r.flight);
     setEditForm({ ...r });
+    // Auto expand too so they can configure booking notes immediately
+    setExpandedFlights((prev) => ({ ...prev, [r.flight]: true }));
   };
+
+  React.useEffect(() => {
+    if (highlightFlight) {
+      setSearch(highlightFlight);
+      const found = rows.find(r => r.flight.toUpperCase() === highlightFlight.toUpperCase());
+      if (found) {
+        setExpandedFlights((prev) => ({ ...prev, [found.flight]: true }));
+      }
+      onClearHighlightFlight?.();
+    }
+  }, [highlightFlight, rows, onClearHighlightFlight]);
 
   const saveEdit = () => {
     if (!editForm) return;
@@ -117,12 +201,17 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
       return;
     }
 
-    const updated = rows.map((r) => (r.flight === editRow ? { ...editForm } : r));
+    const cleanForm = {
+      ...editForm,
+      days: convertNumericDaysToMTWTFSS(editForm.days || ""),
+    };
+
+    const updated = rows.map((r) => (r.flight === editRow ? cleanForm : r));
     setRows(updated);
     
     const ns: FlightSchedule = {};
-    updated.forEach(({ flight, cutoff, dest, cto, etd, eta, airline, days }) => {
-      ns[flight] = { cutoff, dest, cto, etd, eta, airline, days };
+    updated.forEach(({ flight, cutoff, origin, dest, cto, etd, eta, airline, days, emailContacts, contactPhone, bookingPortal, bookingNotes }) => {
+      ns[flight] = { cutoff, origin: origin || "MEL", dest, cto, etd, eta, airline, days, emailContacts, contactPhone, bookingPortal, bookingNotes };
     });
     
     onChange(ns);
@@ -130,10 +219,26 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
   };
 
   const addNew = () => {
-    const nr: RowData = { flight: "NEW_" + Date.now().toString().slice(-4), cutoff: "", dest: "", cto: "QANTAS", etd: "", eta: "", airline: "", days: "" };
+    const nr: RowData = {
+      flight: "NEW_" + Date.now().toString().slice(-4),
+      cutoff: "",
+      origin: "MEL",
+      dest: "",
+      cto: "QANTAS",
+      etd: "",
+      eta: "",
+      airline: "",
+      days: "",
+      emailContacts: "",
+      contactPhone: "",
+      bookingPortal: "",
+      bookingNotes: "",
+    };
     setRows((r) => [...r, nr]);
     setEditRow(nr.flight);
     setEditForm({ ...nr });
+    // Expand for edit
+    setExpandedFlights((prev) => ({ ...prev, [nr.flight]: true }));
   };
 
   const deleteRow = (f: string) => {
@@ -141,8 +246,8 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
     setRows(u);
     
     const ns: FlightSchedule = {};
-    u.forEach(({ flight, cutoff, dest, cto, etd, eta, airline, days }) => {
-      ns[flight] = { cutoff, dest, cto, etd, eta, airline, days };
+    u.forEach(({ flight, cutoff, origin, dest, cto, etd, eta, airline, days, emailContacts, contactPhone, bookingPortal, bookingNotes }) => {
+      ns[flight] = { cutoff, origin: origin || "MEL", dest, cto, etd, eta, airline, days, emailContacts, contactPhone, bookingPortal, bookingNotes };
     });
     
     onChange(ns);
@@ -151,9 +256,10 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
     }
   };
 
-  const ef = (k: keyof RowData) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+  const ef = (k: keyof RowData) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
     if (!editForm) return;
-    const val = e.target.value.toUpperCase();
+    const isNotesOrEmails = k === "emailContacts" || k === "bookingNotes" || k === "bookingPortal";
+    const val = isNotesOrEmails ? e.target.value : e.target.value.toUpperCase();
     let nextForm = { ...editForm, [k]: val };
     if (k === "flight" && val.length >= 2) {
       const derived = getAirlineForFlight(val);
@@ -165,31 +271,21 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
   };
 
   const downloadTemplate = () => {
-    const headers = ["Airline", "Flight", "Days", "Cutoff", "Destination", "CTO", "ETD", "ETA"];
+    const headers = ["AIRLINE", "FLIGHT*", "DAYS", "CUTOFF*", "ORIGIN*", "DESTINATION*", "CTO*", "ETD", "ETA", "EMAIL CONTACTS", "CONTACT PHONE NUMBER", "BOOKING PORTAL WEBSITE", "AIRLINE BOOKING NOTES"];
+    const sampleRow = ["QANTAS", "QF029", "MTWTFSS", "0720", "MEL", "HKG", "QANTAS", "1015", "1755", "dispatch@qantas.com", "+61 3 9999 8888", "https://qantas.com/cargo", "Pre-alert required 4 hours prior. Cargo cutoff strict."];
     
-    const fileRows = [headers];
-    rows.forEach((r) => {
-      fileRows.push([
-        r.airline || getAirlineForFlight(r.flight) || "",
-        r.flight || "",
-        r.days || "",
-        r.cutoff || "",
-        r.dest || "",
-        r.cto || "",
-        r.etd || "",
-        r.eta || ""
-      ]);
-    });
-
-    const csvContent = fileRows
-      .map((r) => r.map((val) => `"${(val || "").replace(/"/g, '""')}"`).join(","))
-      .join("\n");
+    // Create Excel worksheet
+    const worksheet = XLSX.utils.aoa_to_sheet([headers, sampleRow]);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "FlightSchedules");
     
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    // Write array buffer
+    const excelBuffer = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
+    const blob = new Blob([excelBuffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "flight_schedule_mass_update.csv";
+    a.download = "flight_schedule_template.xlsx";
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -200,52 +296,69 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
-        const text = ev.target?.result as string;
-        const lines = text.split(/\r?\n/).filter((l) => l.trim());
-        if (lines.length < 2) {
-          alert("CSV file appears empty or has no data headers.");
+        const data = new Uint8Array(ev.target?.result as ArrayBuffer);
+        const workbook = XLSX.read(data, { type: "array" });
+        const firstSheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[firstSheetName];
+        
+        // Convert worksheet to raw arrays of array (header: 1)
+        const rawRows = XLSX.utils.sheet_to_json<any[]>(worksheet, { header: 1 });
+        if (rawRows.length < 2) {
+          alert("File appears empty or has no data rows.");
           return;
         }
 
-        const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, "").toLowerCase());
+        const headers = rawRows[0].map((h: any) => String(h || "").trim().toLowerCase().replace(/\*/g, "").replace(/\s+/g, ""));
         const colIdx = (key: string) => headers.indexOf(key);
 
-        const getCell = (row: string[], key: string) => {
-          const idx = colIdx(key);
-          if (idx < 0) return "";
-          return (row[idx] || "").trim().replace(/^"|"$/g, "");
+        const getCell = (row: any[], keys: string[]) => {
+          for (const key of keys) {
+            const idx = colIdx(key.replace(/\s+/g, ""));
+            if (idx >= 0 && row[idx] !== undefined && row[idx] !== null) {
+              return String(row[idx]).trim();
+            }
+          }
+          return "";
         };
 
         const updatedRows: RowData[] = [...rows];
         let imported = 0;
 
-        lines.slice(1).forEach((line) => {
-          if (!line.trim()) return;
+        rawRows.slice(1).forEach((cleanRow) => {
+          if (!cleanRow || cleanRow.length === 0) return;
+          if (cleanRow.every(c => c === undefined || c === null || String(c).trim() === "")) return;
 
-          const rawRow = line.match(/(".*?"|[^,]+|(?<=,)(?=,)|(?<=,)$|^(?=,))/g) || line.split(",");
-          const cleanRow = rawRow.map((val) => val.trim().replace(/^"|"$/g, ""));
-
-          const flight = getCell(cleanRow, "flight").toUpperCase();
+          const flight = getCell(cleanRow, ["flight"]).toUpperCase();
           if (!flight) return;
 
-          const airline = getCell(cleanRow, "airline") || getAirlineForFlight(flight);
-          const days = getCell(cleanRow, "days").toUpperCase();
-          const cutoff = getCell(cleanRow, "cutoff");
-          const dest = (getCell(cleanRow, "destination") || getCell(cleanRow, "dest")).toUpperCase();
-          const cto = getCell(cleanRow, "cto").toUpperCase() || "QANTAS";
-          const etd = getCell(cleanRow, "etd");
-          const eta = getCell(cleanRow, "eta");
+          const airline = getCell(cleanRow, ["airline"]) || getAirlineForFlight(flight);
+          const days = convertNumericDaysToMTWTFSS(getCell(cleanRow, ["days"]));
+          const cutoff = getCell(cleanRow, ["cutoff"]);
+          const origin = getCell(cleanRow, ["origin", "orgin"]).toUpperCase() || "MEL";
+          const dest = getCell(cleanRow, ["destination", "dest"]).toUpperCase();
+          const cto = getCell(cleanRow, ["cto"]).toUpperCase() || "QANTAS";
+          const etd = getCell(cleanRow, ["etd"]);
+          const eta = getCell(cleanRow, ["eta"]);
+          const emailContacts = getCell(cleanRow, ["email", "emails", "emailcontacts", "emailcontact", "email contacts"]);
+          const contactPhone = getCell(cleanRow, ["phone", "phones", "contactphone", "contactphones", "telephone", "phone number", "contact phone number", "contactphone#"]);
+          const bookingPortal = getCell(cleanRow, ["portal", "bookingportal", "bookingportalwebsite", "portalwebsite", "website", "booking portal", "booking portal website"]);
+          const bookingNotes = getCell(cleanRow, ["notes", "bookingnotes", "airlinebookingnotes", "airline.bookingnotes", "airline booking notes", "booking notes"]);
 
           const existingIdx = updatedRows.findIndex((r) => r.flight === flight);
           const flightData: RowData = {
             flight,
             cutoff,
+            origin,
             dest,
             cto,
             etd,
             eta,
             airline,
-            days
+            days,
+            emailContacts,
+            contactPhone,
+            bookingPortal,
+            bookingNotes,
           };
 
           if (existingIdx >= 0) {
@@ -257,25 +370,25 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
         });
 
         if (imported === 0) {
-          alert("No valid flight rows found in the CSV file.");
+          alert("No valid flight rows found in the template file.");
           return;
         }
 
         setRows(updatedRows);
 
         const ns: FlightSchedule = {};
-        updatedRows.forEach(({ flight, cutoff, dest, cto, etd, eta, airline, days }) => {
-          ns[flight] = { cutoff, dest, cto, etd, eta, airline, days };
+        updatedRows.forEach(({ flight, cutoff, origin, dest, cto, etd, eta, airline, days, emailContacts, contactPhone, bookingPortal, bookingNotes }) => {
+          ns[flight] = { cutoff, origin, dest, cto, etd, eta, airline, days, emailContacts, contactPhone, bookingPortal, bookingNotes };
         });
         onChange(ns);
 
         alert(`✓ Successfully imported/updated ${imported} flight schedules!`);
       } catch (err) {
         console.error(err);
-        alert("Error parsing CSV schedule. Please make sure format matches template.");
+        alert("Error parsing template file. Please make sure format matches template.");
       }
     };
-    reader.readAsText(file);
+    reader.readAsArrayBuffer(file);
     e.target.value = "";
   };
 
@@ -329,10 +442,10 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
             Clear
           </button>
         )}
-        <input
+         <input
           ref={fileInputRef}
           type="file"
-          accept=".csv"
+          accept=".xlsx,.xls,.csv"
           style={{ display: "none" }}
           onChange={handleImportFile}
         />
@@ -353,9 +466,9 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
             gap: 6,
             transition: "all 0.15s",
           }}
-          title="Upload CSV to insert/update flight schedules in bulk"
+          title="Upload Excel/CSV template to insert or update flight schedules in bulk"
         >
-          <Upload size={14} /> Import CSV
+          <Upload size={14} /> Import Excel / CSV
         </button>
         <button
           onClick={downloadTemplate}
@@ -374,9 +487,9 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
             gap: 6,
             transition: "all 0.15s",
           }}
-          title="Get a pre-populated CSV template with all active flight items"
+          title="Download the updated Excel template for flight schedules"
         >
-          <Download size={14} /> Get CSV Template
+          <Download size={14} /> Template Download
         </button>
         <button
           onClick={addNew}
@@ -433,6 +546,12 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
               <th style={thStyle}>Cutoff</th>
               <th
                 style={{ ...thStyle, cursor: "pointer", userSelect: "none" }}
+                onClick={() => handleSort("origin")}
+              >
+                Origin{renderSortIndicator("origin")}
+              </th>
+              <th
+                style={{ ...thStyle, cursor: "pointer", userSelect: "none" }}
                 onClick={() => handleSort("dest")}
               >
                 Destination{renderSortIndicator("dest")}
@@ -449,8 +568,12 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
             </tr>
           </thead>
           <tbody>
-            {filtered.map((r, i) =>
-              editRow === r.flight && editForm ? (
+            {filtered.flatMap((r, i) => {
+              const isEditing = editRow === r.flight;
+              const isExpanded = !!expandedFlights[r.flight];
+              const hasNotes = !!(r.emailContacts || r.contactPhone || r.bookingPortal || r.bookingNotes);
+
+              const mainRow = isEditing && editForm ? (
                 <tr key={r.flight} style={{ background: "#eff6ff", borderBottom: `1px solid ${T.border}` }}>
                   <td style={{ padding: "5px 8px" }}>
                     <input
@@ -523,6 +646,14 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
                   <td style={{ padding: "5px 8px" }}>
                     <input
                       style={{ ...INP, width: 80, textTransform: "uppercase" }}
+                      value={editForm.origin || ""}
+                      onChange={ef("origin")}
+                      placeholder="Origin"
+                    />
+                  </td>
+                  <td style={{ padding: "5px 8px" }}>
+                    <input
+                      style={{ ...INP, width: 80, textTransform: "uppercase" }}
                       value={editForm.dest}
                       onChange={ef("dest")}
                     />
@@ -589,13 +720,43 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
                   key={r.flight}
                   style={{
                     borderBottom: `1px solid ${T.border}`,
-                    background: getRowBgColor(r.cto, hoveredRow === r.flight, i),
+                    background: getRowBgColor(r.cto, hoveredRow === r.flight || isExpanded, i),
                     transition: "background 0.15s ease",
+                    cursor: "pointer",
                   }}
                   onMouseEnter={() => setHoveredRow(r.flight)}
                   onMouseLeave={() => setHoveredRow(null)}
+                  onClick={(e) => {
+                    const target = e.target as HTMLElement;
+                    if (target.closest("button") || target.closest("input") || target.closest("select") || target.closest("textarea") || target.closest("a")) {
+                      return;
+                    }
+                    toggleExpand(r.flight);
+                  }}
                 >
-                  <td style={{ padding: "9px 12px", fontWeight: 700, color: T.accent }}>{r.airline || "—"}</td>
+                  <td style={{ padding: "9px 12px", fontWeight: 700, color: T.accent, display: "flex", alignItems: "center", gap: 6 }}>
+                    {isExpanded ? <ChevronUp size={14} style={{ color: T.textMuted }} /> : <ChevronDown size={14} style={{ color: T.textMuted }} />}
+                    <span>{r.airline || "—"}</span>
+                    {hasNotes && (
+                      <span
+                        style={{
+                          background: "#fffbeb",
+                          border: "1px solid #fef3c7",
+                          color: "#d97706",
+                          borderRadius: 4,
+                          padding: "2px 5px",
+                          fontSize: "9px",
+                          fontWeight: 600,
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 3
+                        }}
+                        title="Flight Booking Notes & Contacts set"
+                      >
+                        <Info size={10} /> Notes
+                      </span>
+                    )}
+                  </td>
                   <td style={{ padding: "9px 12px", fontWeight: 700, color: "#000000" }}>{r.flight}</td>
                   <td style={{ padding: "9px 12px", fontFamily: "monospace", color: "#475569", fontWeight: 700 }}>
                     {r.days || "—"}
@@ -603,6 +764,7 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
                   <td style={{ padding: "9px 12px", fontFamily: "monospace", color: "#000000", fontWeight: 700 }}>
                     {r.cutoff}
                   </td>
+                  <td style={{ padding: "9px 12px", fontWeight: 700, color: "#2563eb" }}>{r.origin || "MEL"}</td>
                   <td style={{ padding: "9px 12px", fontWeight: 700, color: "#000000" }}>{r.dest || "—"}</td>
                   <td style={{ padding: "9px 12px", color: "#000000", fontWeight: 500 }}>{r.cto}</td>
                   <td style={{ padding: "9px 12px", fontFamily: "monospace", color: "#000000" }}>{r.etd || "—"}</td>
@@ -610,7 +772,10 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
                   <td style={{ padding: "9px 12px" }}>
                     <div style={{ display: "flex", gap: 6 }}>
                       <button
-                        onClick={() => openEdit(r)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openEdit(r);
+                        }}
                         style={{
                           background: T.accentBg,
                           border: `1px solid #bfdbfe`,
@@ -624,7 +789,8 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
                         Edit
                       </button>
                       <button
-                        onClick={() => {
+                        onClick={(e) => {
+                          e.stopPropagation();
                           if (confirmDeleteFlight === r.flight) {
                             deleteRow(r.flight);
                             setConfirmDeleteFlight(null);
@@ -648,8 +814,143 @@ export const FlightAdmin: React.FC<FlightAdminProps> = ({ schedule, onChange }) 
                     </div>
                   </td>
                 </tr>
-              )
-            )}
+              );
+
+              const subRow = isEditing && editForm ? (
+                <tr key={r.flight + "-edit-sub"} style={{ background: "#f0fdf4" }}>
+                  <td colSpan={10} style={{ padding: "12px 18px", borderBottom: `1px solid ${T.border}` }}>
+                    <div style={{
+                      background: "#ffffff",
+                      border: "2px dashed #22c55e",
+                      borderRadius: "12px",
+                      padding: "16px",
+                      boxShadow: "0 4px 12px rgba(0,0,0,0.05)"
+                    }}>
+                      <div style={{ fontWeight: 800, color: "#166534", fontSize: "13px", marginBottom: "12px", display: "flex", gap: "6px", alignItems: "center" }}>
+                        <FileText size={16} /> Airline Booking Notes & Contacts Configuration
+                      </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "16px", marginBottom: "12px" }}>
+                        <div>
+                          <label style={{ display: "flex", gap: "4px", alignItems: "center", fontWeight: 600, color: "#334155", fontSize: "11px", marginBottom: "4px" }}>
+                            <Mail size={12} style={{ color: "#64748b" }} /> Email Contacts
+                          </label>
+                          <input
+                            style={{ ...INP, width: "100%" }}
+                            value={editForm.emailContacts || ""}
+                            onChange={ef("emailContacts")}
+                            placeholder="e.g. imports@carrier.com, reservations@carrier.com"
+                          />
+                        </div>
+                        <div>
+                          <label style={{ display: "flex", gap: "4px", alignItems: "center", fontWeight: 600, color: "#334155", fontSize: "11px", marginBottom: "4px" }}>
+                            <Phone size={12} style={{ color: "#64748b" }} /> Contact Phone Number
+                          </label>
+                          <input
+                            style={{ ...INP, width: "100%" }}
+                            value={editForm.contactPhone || ""}
+                            onChange={ef("contactPhone")}
+                            placeholder="e.g. +61 3 9999 8888"
+                          />
+                        </div>
+                        <div>
+                          <label style={{ display: "flex", gap: "4px", alignItems: "center", fontWeight: 600, color: "#334155", fontSize: "11px", marginBottom: "4px" }}>
+                            <Globe size={12} style={{ color: "#64748b" }} /> Booking Portal website
+                          </label>
+                          <input
+                            style={{ ...INP, width: "100%" }}
+                            value={editForm.bookingPortal || ""}
+                            onChange={ef("bookingPortal")}
+                            placeholder="e.g. https://cargo.carrier.com"
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <label style={{ display: "block", fontWeight: 600, color: "#334155", fontSize: "11px", marginBottom: "4px" }}>Airline Booking Notes</label>
+                        <textarea
+                          style={{
+                            ...INP,
+                            width: "100%",
+                            height: "70px",
+                            resize: "vertical",
+                            fontFamily: "inherit",
+                            fontSize: "12px"
+                          }}
+                          value={editForm.bookingNotes || ""}
+                          onChange={ef("bookingNotes")}
+                          placeholder="Special instructions, SLA rules, loose vs unit cutoffs, or carrier delivery requirements..."
+                        />
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              ) : isExpanded ? (
+                <tr key={r.flight + "-view-sub"} style={{ background: "transparent" }}>
+                  <td colSpan={10} style={{ padding: "12px 18px", borderBottom: `1px solid ${T.border}` }}>
+                    <div style={{
+                      background: "#ffffff",
+                      border: "1px solid #e2e8f0",
+                      borderRadius: "12px",
+                      padding: "14px",
+                      boxShadow: "0 2px 8px rgba(0,0,0,0.02)"
+                    }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px", borderBottom: "1px solid #f1f5f9", paddingBottom: "6px" }}>
+                        <span style={{ fontWeight: 750, color: T.accent, fontSize: "13px", display: "flex", alignItems: "center", gap: "6px" }}>
+                           <FileText size={14} /> Airline Booking Notes & Contact Details
+                        </span>
+                      </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "16px" }}>
+                        <div>
+                          <div style={{ marginBottom: "4px" }}>
+                            <span style={{ fontWeight: 600, color: "#475569", fontSize: "11px", display: "flex", alignItems: "center", gap: "4px" }}>
+                              <Mail size={12} style={{ color: "#64748b" }} /> Email Contacts
+                            </span>
+                          </div>
+                          <div style={{ color: r.emailContacts ? "#0f172a" : "#94a3b8", fontSize: "12px", fontWeight: r.emailContacts ? 500 : 400 }}>
+                            {r.emailContacts ? (
+                              <a href={`mailto:${r.emailContacts}`} style={{ color: T.accent, textDecoration: "none", fontWeight: 600 }}>{r.emailContacts}</a>
+                            ) : "(No email contacts configured)"}
+                          </div>
+                        </div>
+                        <div>
+                          <div style={{ marginBottom: "4px" }}>
+                            <span style={{ fontWeight: 600, color: "#475569", fontSize: "11px", display: "flex", alignItems: "center", gap: "4px" }}>
+                              <Phone size={12} style={{ color: "#64748b" }} /> Phone Number
+                            </span>
+                          </div>
+                          <div style={{ color: r.contactPhone ? "#0f172a" : "#94a3b8", fontSize: "12px", fontWeight: r.contactPhone ? 500 : 400 }}>
+                            {r.contactPhone ? (
+                              <a href={`tel:${r.contactPhone}`} style={{ color: T.accent, textDecoration: "none", fontWeight: 600 }}>{r.contactPhone}</a>
+                            ) : "(No phone contacts configured)"}
+                          </div>
+                        </div>
+                        <div>
+                          <div style={{ marginBottom: "4px" }}>
+                            <span style={{ fontWeight: 600, color: "#475569", fontSize: "11px", display: "flex", alignItems: "center", gap: "4px" }}>
+                              <Globe size={12} style={{ color: "#64748b" }} /> Booking Portal website
+                            </span>
+                          </div>
+                          <div style={{ color: r.bookingPortal ? "#0f172a" : "#94a3b8", fontSize: "12px", fontWeight: r.bookingPortal ? 500 : 400 }}>
+                            {r.bookingPortal ? (
+                              <a href={r.bookingPortal.startsWith("http") ? r.bookingPortal : `https://${r.bookingPortal}`} target="_blank" rel="noopener noreferrer" style={{ color: T.accent, textDecoration: "none", fontWeight: 600 }}>{r.bookingPortal}</a>
+                            ) : "(No booking portal configured)"}
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ marginTop: "12px" }}>
+                        <div style={{ marginBottom: "4px" }}>
+                          <span style={{ fontWeight: 600, color: "#475569", fontSize: "11px" }}>Booking Notes & Special Instructions</span>
+                        </div>
+                        <div style={{ color: r.bookingNotes ? "#0f172a" : "#94a3b8", fontSize: "12px", padding: r.bookingNotes ? "8px 10px" : "0", background: r.bookingNotes ? "#ffffff" : "transparent", borderRadius: "6px", border: r.bookingNotes ? "1px solid #e2e8f0" : "none", whiteSpace: "pre-wrap" }}>
+                          {r.bookingNotes || "(No booking notes configured)"}
+                        </div>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              ) : null;
+
+              return subRow ? [mainRow, subRow] : [mainRow];
+            })}
           </tbody>
         </table>
         </div>
