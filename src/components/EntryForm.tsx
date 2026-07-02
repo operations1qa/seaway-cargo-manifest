@@ -146,7 +146,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({
     const val = e.target.value.toUpperCase();
     const sched = schedule[val];
     if (sched) {
-      const co = form.loadType === "LOOSE" ? ((sched.looseCutoffExempt && sched.looseCutoffTime) ? sched.looseCutoffTime : subtractHour(sched.cutoff)) : sched.cutoff;
+      const co = form.loadType === "LOOSE" ? (sched.looseCutoffExempt ? (sched.looseCutoffTime || sched.cutoff) : (subtractHour(sched.cutoff) || sched.cutoff)) : sched.cutoff;
       const schedCto = sched.cto || "";
       const isCustomCto = schedCto && !availableCtos.includes(schedCto.trim().toUpperCase());
       setIsOther(!!isCustomCto);
@@ -172,7 +172,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({
     const lt = e.target.value;
     const sched = schedule[form.flight];
     if (sched) {
-      const co = lt === "LOOSE" ? ((sched.looseCutoffExempt && sched.looseCutoffTime) ? sched.looseCutoffTime : subtractHour(sched.cutoff)) : sched.cutoff;
+      const co = lt === "LOOSE" ? (sched.looseCutoffExempt ? (sched.looseCutoffTime || sched.cutoff) : (subtractHour(sched.cutoff) || sched.cutoff)) : sched.cutoff;
       setForm((f) => ({
         ...f,
         loadType: lt,

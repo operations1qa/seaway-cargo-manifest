@@ -743,6 +743,8 @@ export default function App() {
               contactPhone: item.contactPhone || "",
               bookingPortal: item.bookingPortal || "",
               bookingNotes: item.bookingNotes || "",
+              looseCutoffExempt: item.looseCutoffExempt || false,
+              looseCutoffTime: item.looseCutoffTime || "",
             };
           }
         }
@@ -1656,7 +1658,9 @@ export default function App() {
             def.emailContacts !== info.emailContacts ||
             def.contactPhone !== info.contactPhone ||
             def.bookingPortal !== info.bookingPortal ||
-            def.bookingNotes !== info.bookingNotes
+            def.bookingNotes !== info.bookingNotes ||
+            def.looseCutoffExempt !== info.looseCutoffExempt ||
+            def.looseCutoffTime !== info.looseCutoffTime
           ) {
             const docId = `${workspaceId}_${selectedPort}_${flight}`;
             batch.set(doc(db, "schedules", docId), {
@@ -1673,6 +1677,8 @@ export default function App() {
               contactPhone: info.contactPhone || "",
               bookingPortal: info.bookingPortal || "",
               bookingNotes: info.bookingNotes || "",
+              looseCutoffExempt: info.looseCutoffExempt || false,
+              looseCutoffTime: info.looseCutoffTime || "",
               ownerId: currentUser.uid,
               workspaceId: workspaceId,
               station: selectedPort,

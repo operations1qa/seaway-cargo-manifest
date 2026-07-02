@@ -786,7 +786,7 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
 
           let cutoff = getCell(cleanRow, "cutoff").toUpperCase();
           if (isMissing(cutoff) && schedInfo) {
-            cutoff = loadType === "LOOSE" ? ((schedInfo.looseCutoffExempt && schedInfo.looseCutoffTime) ? schedInfo.looseCutoffTime : (subtractHour(schedInfo.cutoff) || schedInfo.cutoff)) : schedInfo.cutoff;
+            cutoff = loadType === "LOOSE" ? (schedInfo.looseCutoffExempt ? (schedInfo.looseCutoffTime || schedInfo.cutoff) : (subtractHour(schedInfo.cutoff) || schedInfo.cutoff)) : schedInfo.cutoff;
           }
 
           // Format cutoff to HHMM if it is in HMM format (e.g., 900 -> 0900)
@@ -2021,7 +2021,7 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
                           const sched = schedule[row.flight.toUpperCase()];
                           let nextCutoff = row.cutoff;
                           if (sched && sched.cutoff) {
-                            nextCutoff = nextType === "LOOSE" ? ((sched.looseCutoffExempt && sched.looseCutoffTime) ? sched.looseCutoffTime : (subtractHour(sched.cutoff) || sched.cutoff)) : sched.cutoff;
+                            nextCutoff = nextType === "LOOSE" ? (sched.looseCutoffExempt ? (sched.looseCutoffTime || sched.cutoff) : (subtractHour(sched.cutoff) || sched.cutoff)) : sched.cutoff;
                           }
                           onUpdate?.(row.id, { loadType: nextType, cutoff: nextCutoff });
                         }}

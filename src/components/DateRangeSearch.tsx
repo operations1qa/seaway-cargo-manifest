@@ -2013,7 +2013,7 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
                           const sched = schedule[row.flight.toUpperCase()];
                           let nextCutoff = row.cutoff;
                           if (sched && sched.cutoff) {
-                            nextCutoff = nextType === "LOOSE" ? ((sched.looseCutoffExempt && sched.looseCutoffTime) ? sched.looseCutoffTime : (subtractHour(sched.cutoff) || sched.cutoff)) : sched.cutoff;
+                            nextCutoff = nextType === "LOOSE" ? (sched.looseCutoffExempt ? (sched.looseCutoffTime || sched.cutoff) : (subtractHour(sched.cutoff) || sched.cutoff)) : sched.cutoff;
                           }
                           onUpdate?.(row.id, { loadType: nextType, cutoff: nextCutoff });
                         }}
