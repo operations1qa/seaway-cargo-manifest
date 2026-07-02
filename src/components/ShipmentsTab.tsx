@@ -5,7 +5,7 @@
 
 import React, { useState, useMemo, useRef } from "react";
 import * as XLSX from "xlsx";
-import { Shipment, FlightSchedule } from "../types";
+import { Shipment, FlightSchedule, CtoDirectory } from "../types";
 import { T, cCol } from "../utils/theme";
 import { toDisplay, todayStr, generateJobSheetHtml, subtractHour, getDayOfWeek, formatAwb, isUrgentShipment } from "../utils/helpers";
 import { Pill } from "./UIAtoms";
@@ -41,6 +41,7 @@ interface ShipmentsTabProps {
   selectedDate?: string;
   onSelectedDateChange?: (date: string) => void;
   onGoToFlightSchedule?: (flightCode: string) => void;
+  ctoDirectory?: CtoDirectory;
 }
 
 // Helper to deduce duplicate actual ULD numbers (e.g. PMC13511QF, AKE92169CX, etc.)
@@ -293,6 +294,7 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
   selectedDate,
   onSelectedDateChange,
   onGoToFlightSchedule,
+  ctoDirectory,
 }) => {
   const today = todayStr();
   const [localDate, setLocalDate] = useState(today);
@@ -303,6 +305,19 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<number | null>(null);
   const [selectedAirlineFlight, setSelectedAirlineFlight] = useState<string | null>(null);
   const [highlightedRowId, setHighlightedRowId] = useState<number | null>(null);
+  const [editingCutoffRowId, setEditingCutoffRowId] = useState<number | null>(null);
+  const [inlineCutoffVal, setInlineCutoffVal] = useState("");
+
+  const handleSaveInlineCutoff = (id: number) => {
+    let clean = inlineCutoffVal.trim();
+    if (clean === "") return;
+    if (/^\d{1,3}$/.test(clean)) {
+      clean = clean.padStart(4, "0");
+    }
+    onUpdate?.(id, { cutoff: clean });
+    setEditingCutoffRowId(null);
+    setInlineCutoffVal("");
+  };
   const [showOtherDaysDups, setShowOtherDaysDups] = useState(false);
   const importRef = useRef<HTMLInputElement>(null);
 
@@ -411,6 +426,10 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
   const mismatchCount = useMemo(() => {
     return finalSorted.filter(row => !row.complete && getDayMismatchInfo(row.flight, row.date)).length;
   }, [finalSorted, schedule]);
+
+  const missingCutoffCount = useMemo(() => {
+    return finalSorted.filter(row => !row.complete && (!row.cutoff || row.cutoff.trim() === "" || row.cutoff === "—" || row.cutoff.trim() === "-")).length;
+  }, [finalSorted]);
 
   const TH = (k: keyof Shipment, lbl: string, w?: number) => (
     <th
@@ -595,7 +614,7 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
     reader.onload = (ev) => {
       try {
         const data = new Uint8Array(ev.target?.result as ArrayBuffer);
-        const workbook = XLSX.read(data, { type: "array" });
+        const workbook = XLSX.read(data, { type: "array", cellDates: true });
         const firstSheetName = workbook.SheetNames[0];
         const worksheet = workbook.Sheets[firstSheetName];
         
@@ -607,12 +626,111 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
         }
         
         const headers = rawRows[0].map((h) => String(h || "").trim().toLowerCase().replace(/\*/g, ""));
-        const colIdx = (key: string) => headers.indexOf(key.toLowerCase().replace(/\*/g, ""));
+        const colIdx = (key: string) => {
+          const idx = headers.indexOf(key.toLowerCase().replace(/\*/g, ""));
+          if (idx >= 0) return idx;
+          // Look for any header that contains key
+          return headers.findIndex(h => h.includes(key.toLowerCase()));
+        };
         
-        const getCell = (row: any[], key: string) => {
+        const getRawCell = (row: any[], key: string) => {
           const idx = colIdx(key);
-          if (idx < 0 || row[idx] === undefined || row[idx] === null) return "";
-          return String(row[idx]).trim();
+          if (idx < 0) return undefined;
+          return row[idx];
+        };
+
+        const getCell = (row: any[], key: string) => {
+          const val = getRawCell(row, key);
+          if (val === undefined || val === null) return "";
+          return String(val).trim();
+        };
+
+        const parseExcelDate = (val: any): string => {
+          if (val === undefined || val === null) return "";
+          
+          if (val instanceof Date) {
+            const d = val.getUTCDate().toString().padStart(2, "0");
+            const m = (val.getUTCMonth() + 1).toString().padStart(2, "0");
+            const y = val.getUTCFullYear().toString();
+            return `${d}${m}${y}`;
+          }
+
+          const num = Number(val);
+          if (!isNaN(num) && num > 30000 && num < 60000) {
+            const d = new Date(Math.round((num - 25569) * 86400 * 1000));
+            const day = d.getUTCDate().toString().padStart(2, "0");
+            const month = (d.getUTCMonth() + 1).toString().padStart(2, "0");
+            const year = d.getUTCFullYear().toString();
+            return `${day}${month}${year}`;
+          }
+
+          const str = String(val).trim();
+          if (!str) return "";
+
+          const cleanStr = str.replace(/[-\.]/g, "/");
+
+          // 1. Check for YYYY/MM/DD or YYYY-MM-DD
+          const yyyymmddMatch = cleanStr.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+          if (yyyymmddMatch) {
+            const y = yyyymmddMatch[1];
+            const m = yyyymmddMatch[2].padStart(2, "0");
+            const d = yyyymmddMatch[3].padStart(2, "0");
+            return `${d}${m}${y}`;
+          }
+
+          // 2. Check for DD/MM/YYYY or D/M/YYYY
+          const ddmmyyyyMatch = cleanStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+          if (ddmmyyyyMatch) {
+            const d = ddmmyyyyMatch[1].padStart(2, "0");
+            const m = ddmmyyyyMatch[2].padStart(2, "0");
+            const y = ddmmyyyyMatch[3];
+            return `${d}${m}${y}`;
+          }
+
+          // 3. Check for DD/MM/YY or D/M/YY
+          const ddmmyyMatch = cleanStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})$/);
+          if (ddmmyyMatch) {
+            const d = ddmmyyMatch[1].padStart(2, "0");
+            const m = ddmmyyMatch[2].padStart(2, "0");
+            let y = ddmmyyMatch[3];
+            const yearNum = parseInt(y, 10);
+            y = yearNum < 50 ? `20${y}` : `19${y}`;
+            return `${d}${m}${y}`;
+          }
+
+          // 4. Check for pure digits DDMMYYYY or YYYYMMDD
+          const pureDigits = str.replace(/\D/g, "");
+          if (pureDigits.length === 8) {
+            const first4 = parseInt(pureDigits.slice(0, 4), 10);
+            if (first4 >= 1900 && first4 <= 2100) {
+              const y = pureDigits.slice(0, 4);
+              const m = pureDigits.slice(4, 6);
+              const d = pureDigits.slice(6, 8);
+              return `${d}${m}${y}`;
+            }
+            return pureDigits;
+          }
+
+          if (pureDigits.length === 6) {
+            const d = pureDigits.slice(0, 2);
+            const m = pureDigits.slice(2, 4);
+            let y = pureDigits.slice(4, 6);
+            const yearNum = parseInt(y, 10);
+            y = yearNum < 50 ? `20${y}` : `19${y}`;
+            return `${d}${m}${y}`;
+          }
+
+          // Fallback: standard Date parsing
+          const parsedTimestamp = Date.parse(str);
+          if (!isNaN(parsedTimestamp)) {
+            const d = new Date(parsedTimestamp);
+            const day = d.getDate().toString().padStart(2, "0");
+            const month = (d.getMonth() + 1).toString().padStart(2, "0");
+            const year = d.getFullYear().toString();
+            return `${day}${month}${year}`;
+          }
+
+          return pureDigits.slice(0, 8);
         };
 
         const newRows: Omit<Shipment, "id">[] = [];
@@ -622,9 +740,10 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
           if (!cleanRow || cleanRow.length === 0) return;
           if (cleanRow.every(c => c === undefined || c === null || String(c).trim() === "")) return;
           
-          const dateOrig = getCell(cleanRow, "date(ddmmyyyy)") || getCell(cleanRow, "date");
+          const dateRaw = getRawCell(cleanRow, "date(ddmmyyyy)") ?? getRawCell(cleanRow, "date");
+          const parsedDate = parseExcelDate(dateRaw);
           const awb = getCell(cleanRow, "awb");
-          if (!dateOrig && !awb) return;
+          if (!parsedDate && !awb) return;
 
           const flight = getCell(cleanRow, "flight").toUpperCase().trim();
           // Ensure it gets the data ONLY from the flight number and NOT the destination (dest)
@@ -635,7 +754,17 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
 
           let cutoff = getCell(cleanRow, "cutoff").toUpperCase();
           if (isMissing(cutoff) && schedInfo) {
-            cutoff = loadType === "LOOSE" ? (subtractHour(schedInfo.cutoff) || schedInfo.cutoff) : schedInfo.cutoff;
+            cutoff = loadType === "LOOSE" ? ((schedInfo.looseCutoffExempt && schedInfo.looseCutoffTime) ? schedInfo.looseCutoffTime : (subtractHour(schedInfo.cutoff) || schedInfo.cutoff)) : schedInfo.cutoff;
+          }
+
+          // Format cutoff to HHMM if it is in HMM format (e.g., 900 -> 0900)
+          if (cutoff) {
+            const digits = cutoff.replace(/\D/g, "");
+            if (digits.length === 3) {
+              cutoff = "0" + digits;
+            } else if (digits.length === 4) {
+              cutoff = digits;
+            }
           }
 
           let cto = getCell(cleanRow, "cto").toUpperCase();
@@ -661,7 +790,7 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
           }
 
           newRows.push({
-            date: dateOrig.replace(/\D/g, "").slice(0, 8),
+            date: parsedDate,
             cutoff: cutoff,
             shipper: getCell(cleanRow, "shipper").toUpperCase(),
             awb: formatAwb(awb.toUpperCase()),
@@ -1435,6 +1564,32 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
         </div>
       )}
 
+      {/* Missing Cutoff Alert warning banner */}
+      {missingCutoffCount > 0 && (
+        <div
+          style={{
+            background: "#fff5f5",
+            border: "1px dashed #f87171",
+            color: "#b91c1c",
+            padding: "12px 16px",
+            borderRadius: "16px",
+            fontSize: "12.5px",
+            fontWeight: "bold",
+            marginBottom: "16px",
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            lineHeight: "1.4",
+            boxShadow: "0 1px 3px rgba(0,0,0,0.02)"
+          }}
+        >
+          <span style={{ fontSize: "16px" }}>⚠️</span>
+          <div>
+            <strong>Missing Cutoff Alert:</strong> There are <strong>{missingCutoffCount} shipment(s)</strong> listed on this manifest page with no cutoff time set. Check indicator badges in list below.
+          </div>
+        </div>
+      )}
+
       {/* Shipment Manifest Grid */}
       <div style={{ background: T.surface, border: "1px solid #e5e7eb", borderRadius: 16, overflow: "hidden", boxShadow: "0 10px 30px rgba(0,0,0,0.03)" }}>
         <div style={{ overflowX: "auto" }}>
@@ -1534,7 +1689,113 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
                       whiteSpace: "nowrap", 
                       textDecoration: isComplete ? "line-through" : "none" 
                     }}>
-                      {row.cutoff || "—"}
+                      {editingCutoffRowId === row.id ? (
+                        <div style={{ display: "inline-flex", alignItems: "center", gap: "4px" }} onClick={(e) => e.stopPropagation()}>
+                          <input
+                            type="text"
+                            value={inlineCutoffVal}
+                            onChange={(e) => {
+                              const v = e.target.value.replace(/\D/g, ""); // Allow only digits
+                              if (v.length <= 4) setInlineCutoffVal(v);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                handleSaveInlineCutoff(row.id);
+                              } else if (e.key === "Escape") {
+                                setEditingCutoffRowId(null);
+                              }
+                            }}
+                            placeholder="HHMM"
+                            autoFocus
+                            style={{
+                              width: "55px",
+                              padding: "2px 4px",
+                              fontSize: "12px",
+                              border: "2px solid #0284c7",
+                              borderRadius: "4px",
+                              textAlign: "center",
+                              fontFamily: "monospace",
+                              outline: "none",
+                              color: "#000000",
+                              background: "#ffffff"
+                            }}
+                          />
+                          <button
+                            onClick={() => handleSaveInlineCutoff(row.id)}
+                            style={{
+                              background: "#10b981",
+                              color: "#ffffff",
+                              border: "none",
+                              borderRadius: "4px",
+                              padding: "2px 6px",
+                              fontSize: "11px",
+                              cursor: "pointer",
+                              fontWeight: "bold",
+                              display: "inline-flex",
+                              alignItems: "center",
+                              justifyContent: "center"
+                            }}
+                            title="Save Cutoff"
+                          >
+                            ✓
+                          </button>
+                          <button
+                            onClick={() => setEditingCutoffRowId(null)}
+                            style={{
+                              background: "#ef4444",
+                              color: "#ffffff",
+                              border: "none",
+                              borderRadius: "4px",
+                              padding: "2px 6px",
+                              fontSize: "11px",
+                              cursor: "pointer",
+                              fontWeight: "bold",
+                              display: "inline-flex",
+                              alignItems: "center",
+                              justifyContent: "center"
+                            }}
+                            title="Cancel"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      ) : (!row.cutoff || row.cutoff.trim() === "" || row.cutoff === "—" || row.cutoff.trim() === "-") ? (
+                        <span 
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setEditingCutoffRowId(row.id);
+                            setInlineCutoffVal("");
+                          }}
+                          style={{ 
+                            background: "#fee2e2", 
+                            color: "#ef4444", 
+                            padding: "2px 6px", 
+                            borderRadius: 4, 
+                            fontWeight: 800,
+                            fontSize: 11,
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "4px",
+                            border: "1.5px solid #fca5a5",
+                            cursor: "pointer"
+                          }}
+                          title="Click to enter cutoff time directly!"
+                        >
+                          ⚠️ NO CUTOFF
+                        </span>
+                      ) : (
+                        <span 
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setEditingCutoffRowId(row.id);
+                            setInlineCutoffVal(row.cutoff || "");
+                          }}
+                          style={{ cursor: "pointer", borderBottom: "1px dashed #94a3b8" }}
+                          title="Click to edit cutoff directly"
+                        >
+                          {row.cutoff}
+                        </span>
+                      )}
                       {isUrgent && (
                         <span 
                           style={{ 
@@ -1728,7 +1989,7 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
                           const sched = schedule[row.flight.toUpperCase()];
                           let nextCutoff = row.cutoff;
                           if (sched && sched.cutoff) {
-                            nextCutoff = nextType === "LOOSE" ? (subtractHour(sched.cutoff) || sched.cutoff) : sched.cutoff;
+                            nextCutoff = nextType === "LOOSE" ? ((sched.looseCutoffExempt && sched.looseCutoffTime) ? sched.looseCutoffTime : (subtractHour(sched.cutoff) || sched.cutoff)) : sched.cutoff;
                           }
                           onUpdate?.(row.id, { loadType: nextType, cutoff: nextCutoff });
                         }}
@@ -1815,6 +2076,7 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
         schedule={schedule}
         onClose={() => setSelectedAirlineFlight(null)}
         onGoToFlightSchedule={onGoToFlightSchedule}
+        ctoDirectory={ctoDirectory}
       />
     </div>
   );

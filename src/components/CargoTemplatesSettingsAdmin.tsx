@@ -6,6 +6,16 @@ import { db, handleFirestoreError, OperationType } from "../lib/firebase";
 // Initial set of default instruction templates (now empty so they start clean and delete correctly)
 const DEFAULT_INSTRUCTION_TEMPLATES: any[] = [];
 
+export const PORT_CITIES: Record<string, string> = {
+  ALL: "All Ports",
+  MEL: "Melbourne",
+  SYD: "Sydney",
+  BNE: "Brisbane",
+  CNS: "Cairns",
+  PER: "Perth",
+  ADL: "Adelaide"
+};
+
 interface CargoTemplatesSettingsAdminProps {
   currentUser: any;
   isAdmin: boolean;
@@ -19,7 +29,7 @@ export function CargoTemplatesSettingsAdmin({
   selectedPort,
   offlineMode
 }: CargoTemplatesSettingsAdminProps) {
-  const [templates, setTemplates] = useState<{ id: string; name: string; text: string; port: string; ownerId?: string }[]>([]);
+  const [templates, setTemplates] = useState<{ id: string; name: string; text: string; port: string; ownerId?: string; ownerUsername?: string; isPrivate?: boolean }[]>([]);
   const [loading, setLoading] = useState(true);
   
   // UI views and fields state
@@ -28,6 +38,7 @@ export function CargoTemplatesSettingsAdmin({
   const [nameInput, setNameInput] = useState("");
   const [textInput, setTextInput] = useState("");
   const [portInput, setPortInput] = useState(selectedPort);
+  const [isPrivateInput, setIsPrivateInput] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
 
@@ -92,6 +103,7 @@ export function CargoTemplatesSettingsAdmin({
     setNameInput("");
     setTextInput("");
     setPortInput(selectedPort);
+    setIsPrivateInput(false);
     setErrorMsg("");
     setSuccessMsg("");
   };
@@ -102,6 +114,7 @@ export function CargoTemplatesSettingsAdmin({
     setNameInput(tmpl.name);
     setTextInput(tmpl.text);
     setPortInput(tmpl.port || selectedPort);
+    setIsPrivateInput(!!tmpl.isPrivate);
     setErrorMsg("");
     setSuccessMsg("");
   };
@@ -111,6 +124,7 @@ export function CargoTemplatesSettingsAdmin({
     setEditId(null);
     setNameInput("");
     setTextInput("");
+    setIsPrivateInput(false);
     setErrorMsg("");
   };
 
@@ -136,6 +150,8 @@ export function CargoTemplatesSettingsAdmin({
       text: textInput.trim().toUpperCase(),
       port: tPort,
       ownerId: currentUser?.uid || "system",
+      ownerUsername: currentUser?.displayName || currentUser?.email || "Operator",
+      isPrivate: isPrivateInput,
       updatedAt: new Date().toISOString()
     };
 
@@ -181,8 +197,18 @@ export function CargoTemplatesSettingsAdmin({
   };
 
   const filteredTemplates = templates.filter((t) => {
+    // Privacy filter: if private, only show if ownerId matches current user's uid
+    if (t.isPrivate && t.ownerId !== currentUser?.uid) {
+      return false;
+    }
+
     // Port filter
-    const matchesPort = activeFilterPort === "ALL" || (t.port || "").toUpperCase() === activeFilterPort.toUpperCase();
+    let matchesPort = false;
+    if (activeFilterPort === "ONLY_ME") {
+      matchesPort = !!t.isPrivate;
+    } else {
+      matchesPort = (t.port || "").toUpperCase() === activeFilterPort.toUpperCase();
+    }
     
     // Search query filter
     const query = searchQuery.toLowerCase().trim();
@@ -250,12 +276,9 @@ export function CargoTemplatesSettingsAdmin({
                 type="text"
                 value={nameInput}
                 onChange={(e) => setNameInput(e.target.value)}
-                placeholder="e.g. 🌡️ Temp Sensitive Priority"
+                placeholder=""
                 style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1.5px solid #000000", borderRadius: "8px", outline: "none", boxSizing: "border-box" }}
               />
-              <p style={{ margin: "4px 0 0 0", fontSize: "10px", color: "#64748b" }}>
-                Give the template a short recognizable title (with an emoji icon for clear visual identity).
-              </p>
             </div>
 
             <div>
@@ -269,12 +292,12 @@ export function CargoTemplatesSettingsAdmin({
                   style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1.5px solid #000000", borderRadius: "8px", cursor: "pointer", outline: "none", background: "#ffffff" }}
                 >
                   {["ALL", "MEL", "SYD", "BNE", "CNS", "PER", "ADL"].map((st) => (
-                    <option key={st} value={st}>{st === "ALL" ? "ALL PORTS (GLOBAL TEMPLATE)" : `${st} PORT HUBS`}</option>
+                    <option key={st} value={st}>{PORT_CITIES[st] || st}</option>
                   ))}
                 </select>
               ) : (
                 <div style={{ padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "8px", background: "#f8fafc", color: "#64748b", fontWeight: 700 }}>
-                  📌 Locked to your active operational port: {selectedPort}
+                  📌 Locked to your active operational port: {PORT_CITIES[selectedPort.toUpperCase()] || selectedPort}
                 </div>
               )}
             </div>
@@ -286,13 +309,25 @@ export function CargoTemplatesSettingsAdmin({
               <textarea
                 value={textInput}
                 onChange={(e) => setTextInput(e.target.value)}
-                placeholder="E.G. NOTIFY RAMP TO POSITION NEAR Pit DOOR. DO NOT BLOCK AIR FLOW VENTILATOR GRATE..."
+                placeholder=""
                 rows={4}
                 style={{ width: "100%", padding: "12px", fontSize: "13px", border: "1.5px solid #000000", borderRadius: "8px", outline: "none", resize: "none", fontFamily: "monospace", boxSizing: "border-box" }}
               />
-              <p style={{ margin: "4px 0 0 0", fontSize: "10px", color: "#64748b" }}>
-                Instructions will be automatically UPPERCASED upon insertion for official aviation dispatch logs.
-              </p>
+            </div>
+
+            <div style={{ margin: "4px 0 10px 2px" }}>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "13px", fontWeight: 700, color: "#1e293b", cursor: "pointer", userSelect: "none" }}>
+                <input
+                  type="checkbox"
+                  checked={isPrivateInput}
+                  onChange={(e) => setIsPrivateInput(e.target.checked)}
+                  style={{ width: "16px", height: "16px", cursor: "pointer" }}
+                />
+                🔒 Make Private (Visible Only to Me)
+              </label>
+              <span style={{ display: "block", fontSize: "11px", color: "#64748b", marginLeft: "22px", marginTop: "2px" }}>
+                If enabled, this template will be tied to your username ({currentUser?.displayName || currentUser?.email || "Operator"}) and hidden from other users.
+              </span>
             </div>
 
             <div style={{ display: "flex", gap: "10px", marginTop: "4px" }}>
@@ -339,7 +374,9 @@ export function CargoTemplatesSettingsAdmin({
           <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "12px" }}>
               <span style={{ fontSize: "13px", fontWeight: 800, color: "#475569", textTransform: "uppercase" }}>
-                {activeFilterPort === "ALL" ? "🌍 Showing templates for all active Australian airports" : `📍 PORT ASSOCIATED TEMPLATES LIST: ${activeFilterPort}`}
+                {activeFilterPort === "ALL" ? "🌍 Showing templates for all active Australian airports" :
+                 activeFilterPort === "ONLY_ME" ? "🔒 Showing your private cargo templates" :
+                 `📍 PORT ASSOCIATED TEMPLATES LIST: ${(PORT_CITIES[activeFilterPort.toUpperCase()] || activeFilterPort).toUpperCase()}`}
               </span>
               <button
                 type="button"
@@ -372,30 +409,31 @@ export function CargoTemplatesSettingsAdmin({
                 style={{ flex: 1, minWidth: "160px", padding: "6px 12px", fontSize: "12px", border: "1px solid #cbd5e1", borderRadius: "6px", outline: "none" }}
               />
               
-              {isAdmin && (
-                <div style={{ display: "flex", gap: "4px", flexWrap: "wrap" }}>
-                  {["ALL", "MEL", "SYD", "BNE", "CNS", "PER", "ADL"].map((portOption) => (
-                    <button
-                      key={portOption}
-                      type="button"
-                      onClick={() => setActiveFilterPort(portOption)}
-                      style={{
-                        padding: "4px 10px",
-                        borderRadius: "6px",
-                        border: "1px solid",
-                        borderColor: activeFilterPort === portOption ? "#0284c7" : "#cbd5e1",
-                        fontSize: "11px",
-                        fontWeight: 800,
-                        backgroundColor: activeFilterPort === portOption ? "#e0f2fe" : "#ffffff",
-                        color: activeFilterPort === portOption ? "#0369a1" : "#475569",
-                        cursor: "pointer"
-                      }}
-                    >
-                      {portOption}
-                    </button>
-                  ))}
-                </div>
-              )}
+              <div style={{ display: "flex", gap: "4px", flexWrap: "wrap" }}>
+                {["ALL", "MEL", "SYD", "BNE", "CNS", "PER", "ADL", "ONLY_ME"].map((portOption) => (
+                  <button
+                    key={portOption}
+                    type="button"
+                    onClick={() => setActiveFilterPort(portOption)}
+                    style={{
+                      padding: "4px 10px",
+                      borderRadius: "6px",
+                      border: "1px solid",
+                      borderColor: activeFilterPort === portOption ? (portOption === "ONLY_ME" ? "#ef4444" : "#0284c7") : "#cbd5e1",
+                      fontSize: "11px",
+                      fontWeight: 800,
+                      backgroundColor: activeFilterPort === portOption ? (portOption === "ONLY_ME" ? "#fef2f2" : "#e0f2fe") : "#ffffff",
+                      color: activeFilterPort === portOption ? (portOption === "ONLY_ME" ? "#ef4444" : "#0369a1") : "#475569",
+                      cursor: "pointer",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "3px"
+                    }}
+                  >
+                    {portOption === "ONLY_ME" ? "🔒 ONLY ME" : (PORT_CITIES[portOption.toUpperCase()] || portOption)}
+                  </button>
+                ))}
+              </div>
             </div>
 
             {loading ? (
@@ -424,84 +462,101 @@ export function CargoTemplatesSettingsAdmin({
                       <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "6px" }}>
                         <span style={{ fontSize: "13px", fontWeight: "950", color: "#000000" }}>{tmpl.name}</span>
                         <span style={{ fontSize: "9px", fontWeight: "900", background: "#f1f5f9", color: "#334155", padding: "1px 5px", border: "1.5px solid #000000", borderRadius: "4px" }}>
-                          {tmpl.port || "ALL"}
+                          {PORT_CITIES[(tmpl.port || "ALL").toUpperCase()] || tmpl.port}
                         </span>
+                        {tmpl.isPrivate && (
+                          <span style={{ fontSize: "9px", fontWeight: "900", background: "#fef2f2", color: "#ef4444", padding: "1px 5px", border: "1.5px solid #ef4444", borderRadius: "4px", display: "inline-flex", alignItems: "center", gap: "2px" }} title={`Private to you (${tmpl.ownerUsername || 'Me'})`}>
+                            🔒 Private (Me)
+                          </span>
+                        )}
                       </div>
                       <div style={{ fontSize: "11px", fontFamily: "monospace", color: "#1e293b", background: "#f8fafc", padding: "8px 10px", borderRadius: "6px", border: "1.5px solid #cbd5e1", lineHeight: "1.4" }}>
                         {tmpl.text}
                       </div>
                     </div>
 
-                    <div style={{ display: "flex", gap: "4px", flexShrink: 0 }}>
-                      <button
-                        type="button"
-                        onClick={() => handleEditClick(tmpl)}
-                        style={{
-                          padding: "6px",
-                          borderRadius: "6px",
-                          border: "1.5px solid #000000",
-                          backgroundColor: "#ffffff",
-                          color: "#000000",
-                          cursor: "pointer"
-                        }}
-                        title="Edit template label or content details"
-                      >
-                        <Edit size={12} />
-                      </button>
+                    {(() => {
+                      const canModify = isAdmin || tmpl.ownerId === currentUser?.uid || !tmpl.ownerId;
+                      if (!canModify) {
+                        return (
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "6px", color: "#64748b" }} title="Read-only Template">
+                            🔒
+                          </div>
+                        );
+                      }
+                      return (
+                        <div style={{ display: "flex", gap: "4px", flexShrink: 0 }}>
+                          <button
+                            type="button"
+                            onClick={() => handleEditClick(tmpl)}
+                            style={{
+                              padding: "6px",
+                              borderRadius: "6px",
+                              border: "1.5px solid #000000",
+                              backgroundColor: "#ffffff",
+                              color: "#000000",
+                              cursor: "pointer"
+                            }}
+                            title="Edit template label or content details"
+                          >
+                            <Edit size={12} />
+                          </button>
 
-                      {confirmDeleteId === tmpl.id ? (
-                        <div style={{ display: "flex", gap: "3px", alignItems: "center" }}>
-                          <button
-                            type="button"
-                            onClick={() => handleDelete(tmpl.id)}
-                            style={{
-                              padding: "4px 8px",
-                              borderRadius: "6px",
-                              backgroundColor: "#dc2626",
-                              color: "#ffffff",
-                              fontSize: "11px",
-                              fontWeight: 800,
-                              border: "none",
-                              cursor: "pointer"
-                            }}
-                          >
-                            YES DELETE
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setConfirmDeleteId(null)}
-                            style={{
-                              padding: "4px 8px",
-                              borderRadius: "6px",
-                              backgroundColor: "#64748b",
-                              color: "#ffffff",
-                              fontSize: "11px",
-                              fontWeight: 800,
-                              border: "none",
-                              cursor: "pointer"
-                            }}
-                          >
-                            NO
-                          </button>
+                          {confirmDeleteId === tmpl.id ? (
+                            <div style={{ display: "flex", gap: "3px", alignItems: "center" }}>
+                              <button
+                                type="button"
+                                onClick={() => handleDelete(tmpl.id)}
+                                style={{
+                                  padding: "4px 8px",
+                                  borderRadius: "6px",
+                                  backgroundColor: "#dc2626",
+                                  color: "#ffffff",
+                                  fontSize: "11px",
+                                  fontWeight: 800,
+                                  border: "none",
+                                  cursor: "pointer"
+                                }}
+                              >
+                                YES DELETE
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteId(null)}
+                                style={{
+                                  padding: "4px 8px",
+                                  borderRadius: "6px",
+                                  backgroundColor: "#64748b",
+                                  color: "#ffffff",
+                                  fontSize: "11px",
+                                  fontWeight: 800,
+                                  border: "none",
+                                  cursor: "pointer"
+                                }}
+                              >
+                                NO
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteId(tmpl.id)}
+                              style={{
+                                padding: "6px",
+                                borderRadius: "6px",
+                                border: "1.5px solid #dc2626",
+                                backgroundColor: "#fef2f2",
+                                color: "#dc2626",
+                                cursor: "pointer"
+                              }}
+                              title="Delete this template form"
+                            >
+                              <Trash2 size={12} />
+                            </button>
+                          )}
                         </div>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => setConfirmDeleteId(tmpl.id)}
-                          style={{
-                            padding: "6px",
-                            borderRadius: "6px",
-                            border: "1.5px solid #dc2626",
-                            backgroundColor: "#fef2f2",
-                            color: "#dc2626",
-                            cursor: "pointer"
-                          }}
-                          title="Delete this template form"
-                        >
-                          <Trash2 size={12} />
-                        </button>
-                      )}
-                    </div>
+                      );
+                    })()}
                   </div>
                 ))}
 

@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useRef } from "react";
 import * as XLSX from "xlsx";
-import { Shipment, FlightSchedule } from "../types";
+import { Shipment, FlightSchedule, CtoDirectory } from "../types";
 import { T, cCol } from "../utils/theme";
 import { toDisplay, generateJobSheetHtml, getDayOfWeek, todayStr, subtractHour, isUrgentShipment } from "../utils/helpers";
 import { Pill } from "./UIAtoms";
@@ -16,7 +16,8 @@ import {
   Bookmark, 
   CheckCircle, 
   AlertCircle,
-  Mail
+  Mail,
+  Trash2
 } from "lucide-react";
 import { RangeEmailModal } from "./RangeEmailModal";
 import { AirlineInfoModal } from "./AirlineInfoModal";
@@ -29,10 +30,12 @@ interface DateRangeSearchProps {
   onJobSheet: (row: Shipment) => void;
   onToggleComplete: (id: number) => void;
   onUpdate?: (id: number, fields: Partial<Shipment>) => void;
+  onMassDelete?: (ids: number[]) => Promise<void> | void;
   dupIds: Set<number>;
   dupDetails: { [id: number]: any[] };
   schedule: FlightSchedule;
   onGoToFlightSchedule?: (flightCode: string) => void;
+  ctoDirectory?: CtoDirectory;
   
   // Shared state props
   open: boolean;
@@ -47,77 +50,6 @@ interface DateRangeSearchProps {
   setSelectedResultIds: React.Dispatch<React.SetStateAction<Set<number>>>;
   onClosePane?: () => void;
 }
-
-const DeleteButton: React.FC<{
-  onDelete: (id: number) => void;
-  onUpdate?: (id: number, fields: Partial<Shipment>) => void;
-  id: number;
-  confirmDelete?: boolean;
-  deleteSured?: boolean;
-}> = ({ onDelete, onUpdate, id, confirmDelete, deleteSured }) => {
-  const buttonRef = React.useRef<HTMLButtonElement>(null);
-
-  const isConfirming = !!confirmDelete && !deleteSured;
-  const isSured = !!deleteSured;
-  const buttonText = isConfirming ? "SURE?" : "DELETE";
-
-  React.useEffect(() => {
-    if (!isConfirming) return;
-
-    const handleOutsideClick = (e: MouseEvent) => {
-      if (buttonRef.current && !buttonRef.current.contains(e.target as Node)) {
-        if (onUpdate) {
-          onUpdate(id, { confirmDelete: false, deleteSured: false });
-        }
-      }
-    };
-
-    document.addEventListener("click", handleOutsideClick, true);
-    return () => {
-      document.removeEventListener("click", handleOutsideClick, true);
-    };
-  }, [isConfirming, id, onUpdate]);
-
-  const handleClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (confirmDelete && !deleteSured) {
-      // When clicking "SURE?", save marked state: confirmDelete turns false, deleteSured turns true
-      if (onUpdate) {
-        onUpdate(id, { confirmDelete: false, deleteSured: true });
-      }
-    } else if (deleteSured) {
-      // Already marked black. Clicking "DELETE" deletes completely
-      onDelete(id);
-    } else {
-      // Normal state. Clicking "DELETE" shows "SURE?"
-      if (onUpdate) {
-        onUpdate(id, { confirmDelete: true, deleteSured: false });
-      }
-    }
-  };
-
-  return (
-    <button
-      ref={buttonRef}
-      onClick={handleClick}
-      title={isSured ? "Marked black - click to delete completely" : isConfirming ? "Click SURE to mark this row" : "Delete load record"}
-      style={{
-        background: isSured ? "#ef4444" : isConfirming ? "#000000" : T.redBg,
-        border: `1px solid ${isSured ? "#ef4444" : isConfirming ? "#ffffff" : "#fecaca"}`,
-        color: (isSured || isConfirming) ? "#ffffff" : "#000000",
-        borderRadius: 4,
-        padding: "3px 6px",
-        cursor: "pointer",
-        fontSize: 10,
-        fontWeight: (isSured || isConfirming) ? 900 : 500,
-        whiteSpace: "nowrap",
-        transition: "all 0.1s",
-      }}
-    >
-      {buttonText}
-    </button>
-  );
-};
 
 export const formatTypedDate = (val: string, prevVal: string = ""): string => {
   const clean = val.replace(/\D/g, "").slice(0, 8);
@@ -153,10 +85,12 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
   onJobSheet,
   onToggleComplete,
   onUpdate,
+  onMassDelete,
   dupIds,
   dupDetails,
   schedule,
   onGoToFlightSchedule,
+  ctoDirectory,
   
   open,
   setOpen,
@@ -173,8 +107,34 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
   const [q2, setQ2] = useState("");
   const [showEmailModal, setShowEmailModal] = useState(false);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<number | null>(null);
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
   const [selectedAirlineFlight, setSelectedAirlineFlight] = useState<string | null>(null);
   const [highlightedRowId, setHighlightedRowId] = useState<number | null>(null);
+  const [showAllOverride, setShowAllOverride] = useState(false);
+  const [editingCutoffRowId, setEditingCutoffRowId] = useState<number | null>(null);
+  const [inlineCutoffVal, setInlineCutoffVal] = useState("");
+
+  const handleSaveInlineCutoff = (id: number) => {
+    let clean = inlineCutoffVal.trim();
+    if (clean === "") return;
+    const digits = clean.replace(/\D/g, "");
+    if (digits.length === 3) {
+      clean = "0" + digits;
+    } else if (digits.length === 4) {
+      clean = digits;
+    } else if (/^\d{1,3}$/.test(clean)) {
+      clean = clean.padStart(4, "0");
+    }
+    onUpdate?.(id, { cutoff: clean });
+    setEditingCutoffRowId(null);
+    setInlineCutoffVal("");
+  };
+
+  React.useEffect(() => {
+    if (from || to || q || q2) {
+      setShowAllOverride(false);
+    }
+  }, [from, to, q, q2]);
 
   const handleScrollToRow = (rowId: number) => {
     setHighlightedRowId(rowId);
@@ -246,7 +206,7 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
   };
 
   const results = useMemo(() => {
-    if (!from && !to && !q.trim() && !q2.trim()) return [];
+    if (!showAllOverride && !from && !to && !q.trim() && !q2.trim()) return [];
     
     const fromN = from ? toComparableInt(from) : 0;
     const toN = to ? (toComparableInt(to) || 99999999) : 99999999;
@@ -287,7 +247,7 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
         const cb = parseInt((b.cutoff || "0").replace(/\D/g, ""), 10) || 0;
         return ca - cb;
       });
-  }, [records, from, to, q, q2]);
+  }, [records, from, to, q, q2, showAllOverride]);
 
   const getDayMismatchInfo = (flightCode: string, dateStr: string) => {
     if (!flightCode || !dateStr || dateStr.length !== 8) return null;
@@ -322,6 +282,10 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
   const mismatchCount = useMemo(() => {
     return results.filter(row => !row.complete && getDayMismatchInfo(row.flight, row.date)).length;
   }, [results, schedule]);
+
+  const missingCutoffCount = useMemo(() => {
+    return results.filter(row => !row.complete && (!row.cutoff || row.cutoff.trim() === "" || row.cutoff === "—" || row.cutoff.trim() === "-")).length;
+  }, [results]);
 
   const urgentSearchCount = useMemo(() => {
     return results.filter((r) => isUrgentShipment(r)).length;
@@ -756,19 +720,116 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span
+            <button
+              onClick={() => {
+                setFrom("");
+                setTo("");
+                setQ("");
+                setQ2("");
+                setShowAllOverride(true);
+              }}
+              title="Click to load and show all records"
               style={{
                 background: "#f1f5f9",
                 color: T.textMid,
                 fontSize: 10,
-                fontWeight: 700,
-                padding: "2px 8px",
+                fontWeight: 800,
+                padding: "4px 10px",
                 borderRadius: 10,
-                border: "1px solid #e2e8f0",
+                border: "1px solid #cbd5e1",
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                transition: "all 0.15s ease",
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = "#e2e8f0";
+                e.currentTarget.style.color = T.accent;
+                e.currentTarget.style.borderColor = T.accent;
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "#f1f5f9";
+                e.currentTarget.style.color = T.textMid;
+                e.currentTarget.style.borderColor = "#cbd5e1";
               }}
             >
-              📊 {records.length} Total Records
-            </span>
+              📊 {records.length} Total Records (Show All)
+            </button>
+
+            {selectedShowingCount > 0 && (
+              confirmBulkDelete ? (
+                <div style={{ display: "flex", gap: 3, alignItems: "center", background: "#fee2e2", border: "1px solid #fca5a5", borderRadius: 16, padding: "2px 6px" }}>
+                  <span style={{ fontSize: 9, fontWeight: 800, color: "#991b1b", paddingLeft: 4 }}>Delete {selectedShowingCount}?</span>
+                  <button
+                    onClick={async () => {
+                      const idsToDelete = results.filter((r) => selectedResultIds.has(r.id)).map(r => r.id);
+                      if (onMassDelete) {
+                        await onMassDelete(idsToDelete);
+                      } else {
+                        idsToDelete.forEach(id => onDelete(id));
+                      }
+                      setSelectedResultIds(new Set());
+                      setConfirmBulkDelete(false);
+                    }}
+                    style={{
+                      background: "#dc2626",
+                      color: "#ffffff",
+                      border: "none",
+                      padding: "2px 6px",
+                      borderRadius: 10,
+                      fontSize: 9,
+                      fontWeight: 800,
+                      cursor: "pointer"
+                    }}
+                  >
+                    Yes
+                  </button>
+                  <button
+                    onClick={() => setConfirmBulkDelete(false)}
+                    style={{
+                      background: "#cbd5e1",
+                      color: "#334155",
+                      border: "none",
+                      padding: "2px 6px",
+                      borderRadius: 10,
+                      fontSize: 9,
+                      fontWeight: 800,
+                      cursor: "pointer"
+                    }}
+                  >
+                    No
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setConfirmBulkDelete(true)}
+                  style={{
+                    background: "#fef2f2",
+                    border: "1px solid #fca5a5",
+                    color: "#dc2626",
+                    borderRadius: 16,
+                    padding: "4px 10px",
+                    cursor: "pointer",
+                    fontSize: 11,
+                    fontWeight: 700,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 3,
+                    transition: "all 0.1s ease",
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = "#fee2e2";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = "#fef2f2";
+                  }}
+                >
+                  <Trash2 size={12} />
+                  <span>Mass Delete ({selectedShowingCount})</span>
+                </button>
+              )
+            )}
 
             <button
               onClick={() => {
@@ -1291,8 +1352,80 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
             </button>
 
             {selectedShowingCount > 0 && (
+              confirmBulkDelete ? (
+                <div style={{ display: "flex", gap: 4, alignItems: "center", background: "#fee2e2", border: "1px solid #fca5a5", borderRadius: 16, padding: "5px 10px" }}>
+                  <span style={{ fontSize: 11, fontWeight: 800, color: "#991b1b" }}>Delete {selectedShowingCount} selected?</span>
+                  <button
+                    onClick={async () => {
+                      const idsToDelete = results.filter((r) => selectedResultIds.has(r.id)).map(r => r.id);
+                      if (onMassDelete) {
+                        await onMassDelete(idsToDelete);
+                      } else {
+                        idsToDelete.forEach(id => onDelete(id));
+                      }
+                      setSelectedResultIds(new Set());
+                      setConfirmBulkDelete(false);
+                    }}
+                    style={{
+                      background: "#dc2626",
+                      color: "#ffffff",
+                      border: "none",
+                      padding: "3px 8px",
+                      borderRadius: 12,
+                      fontSize: 10,
+                      fontWeight: 800,
+                      cursor: "pointer"
+                    }}
+                  >
+                    Yes, Delete
+                  </button>
+                  <button
+                    onClick={() => setConfirmBulkDelete(false)}
+                    style={{
+                      background: "#cbd5e1",
+                      color: "#334155",
+                      border: "none",
+                      padding: "3px 8px",
+                      borderRadius: 12,
+                      fontSize: 10,
+                      fontWeight: 800,
+                      cursor: "pointer"
+                    }}
+                  >
+                    No
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setConfirmBulkDelete(true)}
+                  style={{
+                    background: "#fef2f2",
+                    border: "1px solid #fca5a5",
+                    color: "#dc2626",
+                    borderRadius: 16,
+                    padding: "6px 12px",
+                    cursor: "pointer",
+                    fontSize: 11,
+                    fontWeight: 850,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    boxShadow: "0 2px 6px rgba(220, 38, 38, 0.05)",
+                    transition: "all 0.15s ease",
+                  }}
+                >
+                  <Trash2 size={13} />
+                  <span>Bulk Delete Selected ({selectedShowingCount})</span>
+                </button>
+              )
+            )}
+
+            {selectedShowingCount > 0 && (
               <button
-                onClick={() => setSelectedResultIds(new Set())}
+                onClick={() => {
+                  setSelectedResultIds(new Set());
+                  setConfirmBulkDelete(false);
+                }}
                 style={{
                   marginLeft: "auto",
                   background: "transparent",
@@ -1454,6 +1587,31 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
               </div>
             </div>
           )}
+
+          {missingCutoffCount > 0 && (
+            <div
+              style={{
+                background: "#fff5f5",
+                border: "1px dashed #f87171",
+                color: "#b91c1c",
+                padding: "12px 16px",
+                borderRadius: "12px",
+                fontSize: "12.5px",
+                fontWeight: "bold",
+                marginBottom: "12px",
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
+                lineHeight: "1.4",
+                boxShadow: "0 1px 3px rgba(0,0,0,0.02)"
+              }}
+            >
+              <span style={{ fontSize: "16px" }}>⚠️</span>
+              <div>
+                <strong>Missing Cutoff Alert:</strong> There are <strong>{missingCutoffCount} shipment(s)</strong> below with no cutoff time set. Check indicator badges in list below.
+              </div>
+            </div>
+          )}
           <div
             style={{
               overflowX: "auto",
@@ -1502,8 +1660,8 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
                 const isDup = dupIds.has(row.id);
                 const isRowSelected = selectedResultIds.has(row.id);
                 const mismatchInfo = !isComplete ? getDayMismatchInfo(row.flight, row.date) : null;
-                const isConfirmingDelete = !!row.confirmDelete;
-                const isSuredDelete = !!row.deleteSured;
+                const isConfirmingDelete = confirmingDeleteId === row.id;
+                const isSuredDelete = false;
                 const isDeleting = !!row.isDeleted;
                 const isDeletedOrSured = isDeleting || isSuredDelete;
                 const isUrgent = isUrgentShipment(row);
@@ -1580,7 +1738,113 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
                       textDecoration: isComplete ? "line-through" : "none",
                       whiteSpace: "nowrap"
                     }}>
-                      {row.cutoff}
+                      {editingCutoffRowId === row.id ? (
+                        <div style={{ display: "inline-flex", alignItems: "center", gap: "4px" }} onClick={(e) => e.stopPropagation()}>
+                          <input
+                            type="text"
+                            value={inlineCutoffVal}
+                            onChange={(e) => {
+                              const v = e.target.value.replace(/\D/g, ""); // Allow only digits
+                              if (v.length <= 4) setInlineCutoffVal(v);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                handleSaveInlineCutoff(row.id);
+                              } else if (e.key === "Escape") {
+                                setEditingCutoffRowId(null);
+                              }
+                            }}
+                            placeholder="HHMM"
+                            autoFocus
+                            style={{
+                              width: "55px",
+                              padding: "2px 4px",
+                              fontSize: "12px",
+                              border: "2px solid #0284c7",
+                              borderRadius: "4px",
+                              textAlign: "center",
+                              fontFamily: "monospace",
+                              outline: "none",
+                              color: "#000000",
+                              background: "#ffffff"
+                            }}
+                          />
+                          <button
+                            onClick={() => handleSaveInlineCutoff(row.id)}
+                            style={{
+                              background: "#10b981",
+                              color: "#ffffff",
+                              border: "none",
+                              borderRadius: "4px",
+                              padding: "2px 6px",
+                              fontSize: "11px",
+                              cursor: "pointer",
+                              fontWeight: "bold",
+                              display: "inline-flex",
+                              alignItems: "center",
+                              justifyContent: "center"
+                            }}
+                            title="Save Cutoff"
+                          >
+                            ✓
+                          </button>
+                          <button
+                            onClick={() => setEditingCutoffRowId(null)}
+                            style={{
+                              background: "#ef4444",
+                              color: "#ffffff",
+                              border: "none",
+                              borderRadius: "4px",
+                              padding: "2px 6px",
+                              fontSize: "11px",
+                              cursor: "pointer",
+                              fontWeight: "bold",
+                              display: "inline-flex",
+                              alignItems: "center",
+                              justifyContent: "center"
+                            }}
+                            title="Cancel"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      ) : (!row.cutoff || row.cutoff.trim() === "" || row.cutoff === "—" || row.cutoff.trim() === "-") ? (
+                        <span 
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setEditingCutoffRowId(row.id);
+                            setInlineCutoffVal("");
+                          }}
+                          style={{ 
+                            background: "#fee2e2", 
+                            color: "#ef4444", 
+                            padding: "2px 6px", 
+                            borderRadius: 4, 
+                            fontWeight: 800,
+                            fontSize: 10,
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "4px",
+                            border: "1.5px solid #fca5a5",
+                            cursor: "pointer"
+                          }}
+                          title="Click to enter cutoff time directly!"
+                        >
+                          ⚠️ NO CUTOFF
+                        </span>
+                      ) : (
+                        <span 
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setEditingCutoffRowId(row.id);
+                            setInlineCutoffVal(row.cutoff || "");
+                          }}
+                          style={{ cursor: "pointer", borderBottom: "1px dashed #94a3b8" }}
+                          title="Click to edit cutoff directly"
+                        >
+                          {row.cutoff}
+                        </span>
+                      )}
                       {isUrgent && (
                         <span 
                           style={{ 
@@ -1751,7 +2015,7 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
                           const sched = schedule[row.flight.toUpperCase()];
                           let nextCutoff = row.cutoff;
                           if (sched && sched.cutoff) {
-                            nextCutoff = nextType === "LOOSE" ? (subtractHour(sched.cutoff) || sched.cutoff) : sched.cutoff;
+                            nextCutoff = nextType === "LOOSE" ? ((sched.looseCutoffExempt && sched.looseCutoffTime) ? sched.looseCutoffTime : (subtractHour(sched.cutoff) || sched.cutoff)) : sched.cutoff;
                           }
                           onUpdate?.(row.id, { loadType: nextType, cutoff: nextCutoff });
                         }}
@@ -1832,13 +2096,71 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
                         >
                           Edit
                         </button>
-                        <DeleteButton
-                          id={row.id}
-                          onDelete={onDelete}
-                          onUpdate={onUpdate}
-                          confirmDelete={row.confirmDelete}
-                          deleteSured={row.deleteSured}
-                        />
+                        {confirmingDeleteId === row.id ? (
+                          <div style={{ display: "flex", gap: "3px", alignItems: "center" }}>
+                            <button
+                              type="button"
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                onDelete(row.id);
+                                setConfirmingDeleteId(null);
+                              }}
+                              style={{
+                                padding: "4px 8px",
+                                borderRadius: "4px",
+                                backgroundColor: "#dc2626",
+                                color: "#ffffff",
+                                fontSize: "10px",
+                                fontWeight: 800,
+                                border: "none",
+                                cursor: "pointer"
+                              }}
+                            >
+                              Sure?
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setConfirmingDeleteId(null);
+                              }}
+                              style={{
+                                padding: "4px 8.5px",
+                                borderRadius: "4px",
+                                backgroundColor: "#cbd5e1",
+                                color: "#334155",
+                                fontSize: "10px",
+                                border: "none",
+                                cursor: "pointer"
+                              }}
+                            >
+                              No
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setConfirmingDeleteId(row.id);
+                            }}
+                            title="Delete Load Record"
+                            style={{
+                              background: T.redBg,
+                              border: `1px solid #fecaca`,
+                              color: T.red,
+                              borderRadius: 4,
+                              padding: "3px 8px",
+                              cursor: "pointer",
+                              fontSize: 10,
+                              fontWeight: 700,
+                              display: "inline-flex",
+                              alignItems: "center"
+                            }}
+                          >
+                            Del
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -1889,6 +2211,7 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
         schedule={schedule}
         onClose={() => setSelectedAirlineFlight(null)}
         onGoToFlightSchedule={onGoToFlightSchedule}
+        ctoDirectory={ctoDirectory}
       />
     </div>
   );

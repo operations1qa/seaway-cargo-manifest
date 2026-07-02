@@ -11,6 +11,16 @@ import { toDisplay, todayStr, getDayOfWeek, formatAwb } from "../utils/helpers";
 import { doc, getDoc, setDoc, deleteDoc, collection, onSnapshot, query, where } from "firebase/firestore";
 import { auth, db, OperationType, handleFirestoreError } from "../lib/firebase";
 
+const PORT_CITIES: Record<string, string> = {
+  ALL: "All Ports",
+  MEL: "Melbourne",
+  SYD: "Sydney",
+  BNE: "Brisbane",
+  CNS: "Cairns",
+  PER: "Perth",
+  ADL: "Adelaide"
+};
+
 interface LoadsheetModalProps {
   row: Shipment;
   onClose: () => void;
@@ -118,16 +128,38 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
   });
 
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+  
+  // Emailing method process states
+  const [showEmailModal, setShowEmailModal] = useState(false);
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+  const [emailTarget, setEmailTarget] = useState<"cargowise" | "user">("cargowise");
+  const [emailConsolRef, setEmailConsolRef] = useState(row.consolRef || "");
+  const [emailJobRef, setEmailJobRef] = useState(row.jobRef || "");
+  const [emailType, setEmailType] = useState<"CON" | "SHP">(() => {
+    return row.consolRef ? "CON" : "SHP";
+  });
+
+  useEffect(() => {
+    setEmailConsolRef(row.consolRef || "");
+    setEmailJobRef(row.jobRef || "");
+    if (row.consolRef) {
+      setEmailType("CON");
+    } else if (row.jobRef) {
+      setEmailType("SHP");
+    }
+  }, [row.consolRef, row.jobRef]);
   const [templateMenu, setTemplateMenu] = useState<{ x: number, y: number, visible: boolean } | null>(null);
   const [tmplIdToDelete, setTmplIdToDelete] = useState<string | null>(null);
 
-  const [templates, setTemplates] = useState<{ id: string; name: string; text: string; port: string; ownerId?: string }[]>([]);
+  const [templates, setTemplates] = useState<{ id: string; name: string; text: string; port: string; ownerId?: string; ownerUsername?: string; isPrivate?: boolean }[]>([]);
   const [menuMode, setMenuMode] = useState<"select" | "manage" | "add" | "edit">("select");
   const [editTmplId, setEditTmplId] = useState<string | null>(null);
   const [tempName, setTempName] = useState("");
   const [tempText, setTempText] = useState("");
   const [tempPort, setTempPort] = useState("");
+  const [tempIsPrivate, setTempIsPrivate] = useState(false);
   const [templateSearch, setTemplateSearch] = useState("");
+  const [selectedListTab, setSelectedListTab] = useState<"PORT" | "ONLY_ME">("PORT");
 
   useEffect(() => {
     if (offlineMode) {
@@ -167,15 +199,17 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
     return () => unsub();
   }, [offlineMode, currentUser]);
 
-  const handleAddNewTemplate = async (name: string, text: string, pVal: string) => {
+  const handleAddNewTemplate = async (name: string, text: string, pVal: string, isPrivate: boolean) => {
     const cleanedPort = (pVal || "").toUpperCase();
     const newId = `${cleanedPort.toLowerCase()}_${Date.now()}`;
     const newTmpl = {
       id: newId,
       name: name.trim(),
-      text: text.trim(),
+      text: text.trim().toUpperCase(),
       port: cleanedPort,
       ownerId: currentUser?.uid || "system",
+      ownerUsername: currentUser?.displayName || currentUser?.email || "Operator",
+      isPrivate: isPrivate,
       updatedAt: new Date().toISOString()
     };
 
@@ -192,14 +226,16 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
     }
   };
 
-  const handleEditExistingTemplate = async (id: string, name: string, text: string, pVal: string) => {
+  const handleEditExistingTemplate = async (id: string, name: string, text: string, pVal: string, isPrivate: boolean) => {
     const cleanedPort = (pVal || "").toUpperCase();
     const updatedTmpl = {
       id,
       name: name.trim(),
-      text: text.trim(),
+      text: text.trim().toUpperCase(),
       port: cleanedPort,
       ownerId: currentUser?.uid || "system",
+      ownerUsername: currentUser?.displayName || currentUser?.email || "Operator",
+      isPrivate: isPrivate,
       updatedAt: new Date().toISOString()
     };
 
@@ -697,8 +733,22 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
     runPrintWindow();
   };
 
-  const runPrintWindow = () => {
-    if (!printRef.current) return;
+  const loadHtml2Pdf = (): Promise<any> => {
+    return new Promise((resolve, reject) => {
+      if ((window as any).html2pdf) {
+        resolve((window as any).html2pdf);
+        return;
+      }
+      const script = document.createElement("script");
+      script.src = "https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js";
+      script.onload = () => resolve((window as any).html2pdf);
+      script.onerror = (err) => reject(err);
+      document.head.appendChild(script);
+    });
+  };
+
+  const getLoadsheetHtml = () => {
+    if (!printRef.current) return "";
 
     // Dynamically transfer all user input states to raw HTML attributes
     // by cloning the container to preserve live browser UI.
@@ -750,11 +800,11 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
       }
     });
 
-    const content = containerClone.innerHTML;
-    const win = window.open("", "_blank", "width=950,height=800");
-    if (!win) return;
+    // Completely remove print-hidden elements to avoid page overflow
+    containerClone.querySelectorAll(".print-hidden").forEach((el) => el.remove());
 
-    win.document.write(`<!DOCTYPE html><html><head><title>Load Out Sheet - ${ls.shipper}</title>
+    const content = containerClone.innerHTML;
+    return `<!DOCTYPE html><html><head><title>${ls.mawb || row.awb || "AWB"} and loadsheet</title>
     <style>
       * {
         box-sizing: border-box;
@@ -1025,7 +1075,15 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
           padding: 0 !important;
         }
       }
-    </style></head><body>${content}</body></html>`);
+    </style></head><body>${content}</body></html>`;
+  };
+
+  const runPrintWindow = () => {
+    const htmlContent = getLoadsheetHtml();
+    if (!htmlContent) return;
+    const win = window.open("", "_blank", "width=950,height=800");
+    if (!win) return;
+    win.document.write(htmlContent);
     win.document.close();
     win.focus();
     setTimeout(() => {
@@ -1039,8 +1097,504 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
   const lblSt = { fontSize: 9, color: "#000000", textTransform: "uppercase" as const, letterSpacing: ".05em", display: "block", marginBottom: 1, fontWeight: "bold" as const };
   const secSt = { background: "#000000", color: "#ffffff", fontWeight: 700, fontSize: 10, padding: "4px 10px", textTransform: "uppercase" as const, letterSpacing: ".1em" };
 
+  const calculatedSubject = emailType === "CON"
+    ? `[ediDocManager CON MSC ${emailConsolRef.trim().toUpperCase() || "C0000XXXX"}]`
+    : `[ediDocManager SHP MSC ${emailJobRef.trim().toUpperCase() || "S0000XXXX"}]`;
+
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(29,29,31,0.4)", backdropFilter: "blur(4px)", zIndex: 999, display: "flex", alignItems: "flex-start", justifyContent: "center", overflowY: "auto", padding: "20px" }}>
+      
+      {/* Emailing Method Process Modal */}
+      {showEmailModal && (
+        <div style={{
+          position: "fixed",
+          inset: 0,
+          background: "rgba(0, 0, 0, 0.6)",
+          zIndex: 1000,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: 20,
+          backdropFilter: "blur(2px)"
+        }}>
+          <div style={{
+            background: "#ffffff",
+            borderRadius: 16,
+            padding: 28,
+            maxWidth: 700,
+            width: "100%",
+            boxShadow: "0 20px 50px rgba(0,0,0,0.3)",
+            border: "1px solid #e5e7eb",
+            textAlign: "left",
+            fontFamily: "inherit"
+          }}>
+            <h2 style={{ fontSize: "22px", fontWeight: 800, color: "#1e3a8a", margin: "0 0 8px 0" }}>
+              Emailing Method Process
+            </h2>
+            <p style={{ fontSize: "14px", color: "#2563eb", fontWeight: "500", margin: "0 0 20px 0", lineHeight: "1.5" }}>
+              The subject line must be in the correct format in order for it to attach to the eDocs tab of the job.
+            </p>
+
+            {/* Email process specifications */}
+            <div style={{ background: "#f8fafc", borderLeft: "4px solid #3b82f6", padding: "16px", borderRadius: "8px", marginBottom: "20px" }}>
+              <ul style={{ margin: 0, paddingLeft: "20px", display: "flex", flexDirection: "column", gap: "8px", fontSize: "13.5px", color: "#334155" }}>
+                <li>Email to be sent to <strong style={{ color: "#2563eb" }}>edisapmel@seaway.com.au</strong></li>
+                <li>Email subject to be as follows: <strong style={{ color: "#0f172a", fontFamily: "monospace", background: "#e2e8f0", padding: "2px 6px", borderRadius: "4px" }}>[ediDocManager {emailType} MSC {emailType === "CON" ? (emailConsolRef.toUpperCase() || "C0000XXXX") : (emailJobRef.toUpperCase() || "S0000XXXX")}]</strong></li>
+                <li>Where the module code <strong style={{ color: "#0f172a" }}>{emailType}</strong> is used, this represents the module we want to eDoc to.</li>
+                <li><strong style={{ color: "#0f172a" }}>MSC</strong> is the doc type we wish to eDoc (Loadsheet).</li>
+                <li><strong style={{ color: "#0f172a" }}>{emailType === "CON" ? (emailConsolRef.toUpperCase() || "C0000XXXX") : (emailJobRef.toUpperCase() || "S0000XXXX")}</strong> is of course the Shipment / Consolidation Number (Job Reference).</li>
+              </ul>
+              
+              <div style={{ marginTop: "16px", borderTop: "1px dashed #cbd5e1", paddingTop: "12px" }}>
+                <span style={{ fontSize: "12px", fontWeight: "700", color: "#64748b", textTransform: "uppercase", display: "block", marginBottom: "4px" }}>
+                  Examples that could be used to allocate a Loadsheet document automatically include:
+                </span>
+                <ul style={{ margin: 0, paddingLeft: "20px", display: "flex", flexDirection: "column", gap: "4px", fontSize: "12.5px", color: "#475569" }}>
+                  <li>For Consolidations: <code style={{ fontWeight: "700", color: "#1e3a8a" }}>[ediDocManager CON MSC C0000XXXX]</code></li>
+                  <li>For Shipments: <code style={{ fontWeight: "700", color: "#1e3a8a" }}>[ediDocManager SHP MSC S0000XXXX]</code></li>
+                </ul>
+              </div>
+            </div>
+
+            {/* Form Inputs for Reference Numbers */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", marginBottom: "20px" }}>
+              <div>
+                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>Consol Number (CON):</label>
+                <input
+                  type="text"
+                  placeholder="e.g. C0000XXXX"
+                  value={emailConsolRef}
+                  onChange={(e) => {
+                    const val = e.target.value.toUpperCase();
+                    setEmailConsolRef(val);
+                    if (val.trim()) {
+                      setEmailType("CON");
+                    }
+                    if (onUpdateShipment) {
+                      onUpdateShipment(row.id, { consolRef: val });
+                    }
+                  }}
+                  style={{ width: "100%", padding: "10px 12px", fontSize: "13.5px", border: "1px solid #cbd5e1", borderRadius: "8px", outline: "none", boxSizing: "border-box", fontWeight: "bold" }}
+                />
+              </div>
+              <div>
+                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>Job Number (SHP):</label>
+                <input
+                  type="text"
+                  placeholder="e.g. S0000XXXX"
+                  value={emailJobRef}
+                  onChange={(e) => {
+                    const val = e.target.value.toUpperCase();
+                    setEmailJobRef(val);
+                    if (val.trim() && !emailConsolRef.trim()) {
+                      setEmailType("SHP");
+                    }
+                    if (onUpdateShipment) {
+                      onUpdateShipment(row.id, { jobRef: val });
+                    }
+                  }}
+                  style={{ width: "100%", padding: "10px 12px", fontSize: "13.5px", border: "1px solid #cbd5e1", borderRadius: "8px", outline: "none", boxSizing: "border-box", fontWeight: "bold" }}
+                />
+              </div>
+            </div>
+
+            {/* Toggle Target Type */}
+            <div style={{ marginBottom: "20px" }}>
+              <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>Module Code Destination:</label>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <button
+                  onClick={() => setEmailType("CON")}
+                  style={{
+                    flex: 1,
+                    padding: "8px 12px",
+                    borderRadius: "8px",
+                    border: "1px solid " + (emailType === "CON" ? "#2563eb" : "#cbd5e1"),
+                    background: emailType === "CON" ? "#eff6ff" : "#ffffff",
+                    color: emailType === "CON" ? "#2563eb" : "#475569",
+                    fontWeight: "700",
+                    fontSize: "13px",
+                    cursor: "pointer"
+                  }}
+                >
+                  CON (Consolidation - {emailConsolRef || "None entered"})
+                </button>
+                <button
+                  onClick={() => setEmailType("SHP")}
+                  style={{
+                    flex: 1,
+                    padding: "8px 12px",
+                    borderRadius: "8px",
+                    border: "1px solid " + (emailType === "SHP" ? "#2563eb" : "#cbd5e1"),
+                    background: emailType === "SHP" ? "#eff6ff" : "#ffffff",
+                    color: emailType === "SHP" ? "#2563eb" : "#475569",
+                    fontWeight: "700",
+                    fontSize: "13px",
+                    cursor: "pointer"
+                  }}
+                >
+                  SHP (Shipment - {emailJobRef || "None entered"})
+                </button>
+              </div>
+            </div>
+
+            {/* Choose Recipient Email */}
+            <div style={{ marginBottom: "20px" }}>
+              <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>Recipient Email Address:</label>
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <label style={{ display: "flex", alignItems: "center", gap: "10px", fontSize: "14px", color: "#1e293b", cursor: "pointer", background: emailTarget === "cargowise" ? "#f8fafc" : "transparent", padding: "8px 12px", borderRadius: "8px", border: "1px solid " + (emailTarget === "cargowise" ? "#cbd5e1" : "transparent") }}>
+                  <input
+                    type="radio"
+                    name="emailTarget"
+                    checked={emailTarget === "cargowise"}
+                    onChange={() => setEmailTarget("cargowise")}
+                  />
+                  <span>Send to Cargowise: <strong style={{ color: "#2563eb" }}>edisapmel@seaway.com.au</strong></span>
+                </label>
+                <label style={{ display: "flex", alignItems: "center", gap: "10px", fontSize: "14px", color: "#1e293b", cursor: "pointer", background: emailTarget === "user" ? "#f8fafc" : "transparent", padding: "8px 12px", borderRadius: "8px", border: "1px solid " + (emailTarget === "user" ? "#cbd5e1" : "transparent") }}>
+                  <input
+                    type="radio"
+                    name="emailTarget"
+                    checked={emailTarget === "user"}
+                    onChange={() => setEmailTarget("user")}
+                  />
+                  <span>Send to your login email: <strong style={{ color: "#2563eb" }}>{currentUser?.email || "dispatcher@seaway.com.au"}</strong></span>
+                </label>
+              </div>
+            </div>
+
+            {/* Generated Subject Line Display */}
+            <div style={{ background: "#f1f5f9", padding: "12px 16px", borderRadius: "8px", border: "1px solid #e2e8f0", marginBottom: "20px" }}>
+              <span style={{ fontSize: "11px", fontWeight: "700", color: "#64748b", textTransform: "uppercase", display: "block", marginBottom: "4px" }}>
+                Generated Email Subject:
+              </span>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px" }}>
+                <span style={{ fontFamily: "monospace", fontSize: "14px", fontWeight: "700", color: "#0f172a", wordBreak: "break-all" }}>
+                  {calculatedSubject}
+                </span>
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText(calculatedSubject);
+                    alert("✓ Subject line copied to clipboard!");
+                  }}
+                  style={{
+                    background: "#ffffff",
+                    border: "1px solid #cbd5e1",
+                    borderRadius: "6px",
+                    padding: "4px 10px",
+                    fontSize: "12px",
+                    fontWeight: "600",
+                    color: "#475569",
+                    cursor: "pointer",
+                    whiteSpace: "nowrap"
+                  }}
+                >
+                  📋 Copy Subject
+                </button>
+              </div>
+            </div>
+
+            {/* Info tip about saving AWB# and loadsheet */}
+            <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", padding: "12px", borderRadius: "8px", marginBottom: "24px", color: "#1e3a8a", fontSize: "13px", lineHeight: "1.4" }}>
+              💡 <strong>Automatic PDF Attachment:</strong> Clicking <strong>"Open Email Client"</strong> below will instantly generate and download the actual loadsheet as a professional PDF document titled <strong>"{ls.mawb || row.awb || "AWB"} and loadsheet.pdf"</strong> while opening your email composer. You can instantly drag and drop or attach this downloaded PDF to your email!
+              {includeCarcases ? (
+                <div style={{ marginTop: "6px", fontWeight: "bold", color: "#2563eb" }}>
+                  🥩 Both Page 1 (Loadsheet) and Page 2 (Carcase Control Sheet) will be included in the PDF.
+                </div>
+              ) : (
+                <div style={{ marginTop: "6px", fontWeight: "bold", color: "#2563eb" }}>
+                  📄 Only Page 1 (Loadsheet) will be included in the PDF, as the Carcase Sheet is not selected.
+                </div>
+              )}
+            </div>
+
+            {/* Action buttons */}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                disabled={isGeneratingPdf}
+                onClick={() => setShowEmailModal(false)}
+                style={{
+                  flex: 1,
+                  background: "#f3f4f6",
+                  color: "#374151",
+                  border: "1px solid #d1d5db",
+                  borderRadius: 10,
+                  padding: "12px 16px",
+                  fontSize: 14,
+                  fontWeight: 600,
+                  cursor: isGeneratingPdf ? "not-allowed" : "pointer",
+                  transition: "background 0.2s",
+                  opacity: isGeneratingPdf ? 0.6 : 1
+                }}
+              >
+                Close
+              </button>
+              <button
+                disabled={isGeneratingPdf}
+                onClick={async () => {
+                  if (isGeneratingPdf) return;
+                  setIsGeneratingPdf(true);
+                  try {
+                    const container = printRef.current;
+                    if (!container) {
+                      throw new Error("No print container found.");
+                    }
+
+                    // Load html2pdf from CDN dynamically
+                    const html2pdf = await loadHtml2Pdf();
+
+                    // Clone container to set input values and textareas
+                    const containerClone = container.cloneNode(true) as HTMLDivElement;
+                    const originalInputs = container.querySelectorAll("input, textarea");
+                    const clonedInputs = containerClone.querySelectorAll("input, textarea");
+
+                    clonedInputs.forEach((clonedInput, index) => {
+                      const origEl = originalInputs[index] as HTMLInputElement | HTMLTextAreaElement;
+                      const el = clonedInput as HTMLInputElement | HTMLTextAreaElement;
+
+                      if (el.type === "checkbox") {
+                        const cb = origEl as HTMLInputElement;
+                        if (cb.checked) {
+                          el.setAttribute("checked", "checked");
+                        } else {
+                          el.removeAttribute("checked");
+                        }
+                      } else {
+                        el.setAttribute("value", origEl.value || "");
+                      }
+
+                      if (el.tagName === "TEXTAREA") {
+                        const div = document.createElement("div");
+                        div.className = el.className;
+                        div.textContent = origEl.value || "—";
+                        const origStyle = window.getComputedStyle(origEl);
+                        div.setAttribute("style", `
+                          white-space: pre-wrap;
+                          word-break: break-word;
+                          font-family: Arial, sans-serif;
+                          font-weight: bold;
+                          font-size: ${origStyle.fontSize || "11px"};
+                          line-height: ${origStyle.lineHeight || "1.25"};
+                          border: 2px solid #000000;
+                          padding: 6px 8px;
+                          min-height: 85px;
+                          height: auto;
+                          box-sizing: border-box;
+                          background: #ffffff;
+                          margin-bottom: 4px;
+                        `);
+                        el.parentNode?.replaceChild(div, el);
+                      }
+                    });
+
+                    // Completely remove print-hidden elements to avoid page overflow in PDF
+                    containerClone.querySelectorAll(".print-hidden").forEach((el) => el.remove());
+
+                    // Create high-fidelity styles wrapper for the PDF engine
+                    const wrapper = document.createElement("div");
+                    wrapper.style.padding = "10px";
+                    wrapper.style.background = "#ffffff";
+                    wrapper.style.fontFamily = "Arial, sans-serif";
+                    wrapper.style.fontSize = "11px";
+                    wrapper.style.color = "#000000";
+
+                    const styleEl = document.createElement("style");
+                    styleEl.textContent = `
+                      * {
+                        box-sizing: border-box;
+                        margin: 0;
+                        padding: 0;
+                        -webkit-print-color-adjust: exact !important;
+                        print-color-adjust: exact !important;
+                      }
+                      #loadsheet-print-container {
+                        padding: 4px !important;
+                      }
+                      #loadsheet-page-1 {
+                        font-size: 10px !important;
+                        line-height: 1.25 !important;
+                      }
+                      .print-page-inner > div {
+                        margin-bottom: 2px !important;
+                      }
+                      table {
+                        width: 100%;
+                        border-collapse: collapse;
+                        border: 2px solid #000000 !important;
+                      }
+                      td {
+                        border: 2px solid #000000 !important;
+                        padding: 2px 4px !important;
+                        vertical-align: middle !important;
+                        color: #000000 !important;
+                      }
+                      th {
+                        border: 2px solid #000000 !important;
+                        padding: 4px 4px !important;
+                        vertical-align: middle;
+                        background: #000000 !important;
+                        color: #ffffff !important;
+                        -webkit-text-fill-color: #ffffff !important;
+                        font-size: 12px !important;
+                        font-weight: 900 !important;
+                        text-transform: uppercase;
+                      }
+                      .cargo-table th {
+                        padding: 4px 4px !important;
+                        font-size: 11px !important;
+                      }
+                      .cargo-table td {
+                        padding: 0 !important;
+                      }
+                      .cargo-table td input {
+                        padding: 4px 6px !important;
+                        font-size: 11px !important;
+                        font-weight: bold !important;
+                      }
+                      .cargo-table tr {
+                        line-height: 1.1 !important;
+                      }
+                      /* Compress signature boxes height */
+                      .print-page-inner div[style*="min-height: 76"] {
+                        min-height: 48px !important;
+                        height: 48px !important;
+                      }
+                      .print-page-inner div[style*="min-height: 76"] input {
+                        font-size: 10px !important;
+                        padding: 1px !important;
+                      }
+                      /* Compress temperature boxes height */
+                      .print-page-inner div[style*="min-height: 45"] {
+                        min-height: 35px !important;
+                        height: 35px !important;
+                      }
+                      .print-page-inner div[style*="min-height: 45"] input {
+                        font-size: 12px !important;
+                      }
+                      /* Compress textareas / free-type boxes height */
+                      #loadsheet-page-1 textarea,
+                      #loadsheet-page-1 div[style*="min-height: 85"],
+                      #loadsheet-page-1 .with-border {
+                        height: 90px !important;
+                        min-height: 90px !important;
+                        font-size: 10px !important;
+                        padding: 4px 6px !important;
+                      }
+                      .hdr {
+                        font-size: 14px !important;
+                        font-weight: bold;
+                        text-align: center;
+                        border: 2px solid #000000 !important;
+                        padding: 3px !important;
+                        margin-bottom: 2px !important;
+                        letter-spacing: 2px;
+                        color: #000000 !important;
+                        background: #ffffff !important;
+                      }
+                      .sub {
+                        text-align: center;
+                        font-size: 8px !important;
+                        color: #000000 !important;
+                        margin-bottom: 4px !important;
+                        font-weight: bold;
+                      }
+                      .sec {
+                        background: #000000 !important;
+                        color: #ffffff !important;
+                        font-weight: bold;
+                        font-size: 8px !important;
+                        padding: 2px 4px !important;
+                        text-transform: uppercase;
+                        letter-spacing: .1em;
+                        -webkit-print-color-adjust: exact !important;
+                        print-color-adjust: exact !important;
+                      }
+                      .lbl {
+                        font-size: 8px;
+                        color: #000000 !important;
+                        font-weight: bold;
+                        display: block;
+                        text-transform: uppercase;
+                        margin-bottom: 1px;
+                      }
+                      .val {
+                        font-size: 10px !important;
+                        font-weight: bold;
+                        color: #000000 !important;
+                      }
+                      .freetext {
+                        font-size: 10px !important;
+                        color: #000000 !important;
+                      }
+                      input {
+                        border: none !important;
+                        width: 100%;
+                        outline: none !important;
+                        background: transparent !important;
+                        color: #000000 !important;
+                        font-family: inherit !important;
+                        font-weight: bold !important;
+                        font-size: 11px !important;
+                      }
+                      .print-hidden {
+                        display: none !important;
+                      }
+                      .page-break {
+                        page-break-before: always !important;
+                        break-before: page !important;
+                      }
+                    `;
+                    wrapper.appendChild(styleEl);
+                    wrapper.appendChild(containerClone);
+
+                    const opt = {
+                      margin: [0.15, 0.15, 0.15, 0.15],
+                      filename: `${ls.mawb || row.awb || "AWB"} and loadsheet.pdf`,
+                      image: { type: 'jpeg', quality: 0.98 },
+                      html2canvas: { 
+                        scale: 2, 
+                        useCORS: true, 
+                        logging: false 
+                      },
+                      jsPDF: { 
+                        unit: 'in', 
+                        format: 'a4', 
+                        orientation: 'portrait' 
+                      },
+                      pagebreak: { mode: ['css', 'legacy'] }
+                    };
+
+                    await html2pdf().set(opt).from(wrapper).save();
+                  } catch (error) {
+                    console.error("PDF generation failed:", error);
+                    alert("⚠️ Local PDF compilation failed. Opening email client anyway!");
+                  } finally {
+                    setIsGeneratingPdf(false);
+                  }
+
+                  const targetAddress = emailTarget === "cargowise" ? "edisapmel@seaway.com.au" : (currentUser?.email || "dispatcher@seaway.com.au");
+                  const mailtoUrl = `mailto:${targetAddress}?subject=${encodeURIComponent(calculatedSubject)}&body=${encodeURIComponent(`Hi Team,\n\nPlease find attached the Loadsheet for AWB ${ls.mawb || row.awb || "AWB"}.\n\nReference: ${emailType === "CON" ? (emailConsolRef || "N/A") : (emailJobRef || "N/A")}\n\nKind regards,\n${currentUser?.displayName || "Dispatcher"}`)}`;
+                  window.location.href = mailtoUrl;
+                }}
+                style={{
+                  flex: 1,
+                  background: isGeneratingPdf ? "#86868b" : "#0284c7",
+                  color: "#ffffff",
+                  border: "none",
+                  borderRadius: 10,
+                  padding: "12px 16px",
+                  fontSize: 14,
+                  fontWeight: 600,
+                  cursor: isGeneratingPdf ? "not-allowed" : "pointer",
+                  transition: "background 0.2s"
+                }}
+              >
+                {isGeneratingPdf ? "⏳ Generating PDF..." : "Open Email Client 📧"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Custom absolute confirmation modal overlay safe for sandbox iframes */}
       {showResetConfirm && (
         <div style={{
@@ -1162,6 +1716,7 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
               🔄 Reset Defaults
             </button>
             <button id="load-sheet-print-btn" onClick={handlePrint} style={{ background: ls.operator.trim() ? T.accent : "#86868b", border: "none", color: "#fff", borderRadius: 20, padding: "8px 18px", cursor: "pointer", fontWeight: 600, fontSize: 13 }}>🖨 Print</button>
+            <button id="load-sheet-email-btn" onClick={() => setShowEmailModal(true)} style={{ background: "#0284c7", border: "none", color: "#fff", borderRadius: 20, padding: "8px 18px", cursor: "pointer", fontWeight: 600, fontSize: 13, display: "flex", alignItems: "center", gap: "4px" }}>📧 Send Email</button>
             <button id="load-sheet-close-btn" onClick={onClose} style={{ background: "#e5e7eb", border: "none", color: T.textMid, borderRadius: 20, padding: "8px 16px", cursor: "pointer", fontSize: 13, fontWeight: 500 }}>✕ Close</button>
           </div>
         </div>
@@ -1445,9 +2000,6 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                   overflowY: "auto"
                 }}
               />
-              <span className="print-hidden" style={{ fontSize: 8, color: "#64748b", fontWeight: "700", marginBottom: 4, textTransform: "uppercase" }}>
-                💡 TIP: RIGHT-CLICK TEXTAREA TO CHOOSE PRE-DEFINED CARGO TEMPLATES
-              </span>
 
               {templateMenu && templateMenu.visible && (
                 <>
@@ -1537,8 +2089,16 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                     {menuMode === "select" && (() => {
                       const targetPortValue = (row.station || activePort || "MEL").toUpperCase();
                       const filteredByPort = templates.filter(tmpl => {
-                        const tPort = (tmpl.port || "").toUpperCase();
-                        return tPort === targetPortValue || tPort === "ALL";
+                        // Check privacy: if isPrivate is true, it MUST belong to the current user
+                        if (tmpl.isPrivate && tmpl.ownerId !== currentUser?.uid) {
+                          return false;
+                        }
+                        if (selectedListTab === "ONLY_ME") {
+                          return !!tmpl.isPrivate;
+                        } else {
+                          const tPort = (tmpl.port || "").toUpperCase();
+                          return tPort === targetPortValue || tPort === "ALL";
+                        }
                       });
                       const sortedTemplates = [...filteredByPort].sort((a, b) => a.name.localeCompare(b.name));
                       const filteredAndSortedTemplates = sortedTemplates.filter((tmpl) => {
@@ -1570,6 +2130,45 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                                 boxSizing: "border-box"
                               }}
                             />
+                          </div>
+
+                          {/* Sub-tabs Selection */}
+                          <div style={{ display: "flex", borderBottom: "2px solid #000000", background: "#e2e8f0" }}>
+                            <button
+                              type="button"
+                              onClick={() => setSelectedListTab("PORT")}
+                              style={{
+                                flex: 1,
+                                padding: "5px 4px",
+                                fontSize: "8.5px",
+                                fontWeight: "900",
+                                background: selectedListTab === "PORT" ? "#ffffff" : "transparent",
+                                color: "#000000",
+                                border: "none",
+                                borderRight: "2px solid #000000",
+                                cursor: "pointer",
+                                textTransform: "uppercase"
+                              }}
+                            >
+                              📍 PORT ({(PORT_CITIES[targetPortValue] || targetPortValue).toUpperCase()})
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSelectedListTab("ONLY_ME")}
+                              style={{
+                                flex: 1,
+                                padding: "5px 4px",
+                                fontSize: "8.5px",
+                                fontWeight: "900",
+                                background: selectedListTab === "ONLY_ME" ? "#ffffff" : "transparent",
+                                color: "#000000",
+                                border: "none",
+                                cursor: "pointer",
+                                textTransform: "uppercase"
+                              }}
+                            >
+                              🔒 ONLY ME ({templates.filter(t => t.isPrivate && t.ownerId === currentUser?.uid).length})
+                            </button>
                           </div>
                           
                           {/* Scrollable Container */}
@@ -1614,12 +2213,13 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                                 title="Click to insert this template text"
                               >
                                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
-                                  <span style={{ fontWeight: "900" }}>{tmpl.name}</span>
-                                  {isAdmin && (
-                                    <span style={{ fontSize: "8px", fontWeight: "900", background: "#f1f5f9", color: "#334155", padding: "1px 4px", borderRadius: "3.5px" }}>
-                                      {tmpl.port || "ALL"}
-                                    </span>
-                                  )}
+                                  <span style={{ fontWeight: "900", display: "flex", alignItems: "center", gap: "4px" }}>
+                                    {tmpl.name}
+                                    {tmpl.isPrivate && <span style={{ fontSize: "8px", color: "#ef4444" }} title={`Private to you (${tmpl.ownerUsername || 'Me'})`}>🔒 ONLY ME</span>}
+                                  </span>
+                                  <span style={{ fontSize: "8px", fontWeight: "900", background: "#f1f5f9", color: "#334155", padding: "1px 4px", borderRadius: "3.5px" }}>
+                                    {PORT_CITIES[(tmpl.port || "ALL").toUpperCase()] || tmpl.port}
+                                  </span>
                                 </div>
                                 <div style={{ fontSize: "8.5px", fontWeight: "normal", opacity: 0.8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                                   {tmpl.text}
@@ -1642,13 +2242,60 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                     {menuMode === "manage" && (() => {
                       const targetPortValue = (row.station || activePort || "MEL").toUpperCase();
                       const filteredManage = templates.filter(tmpl => {
-                        const tPort = (tmpl.port || "").toUpperCase();
-                        return tPort === targetPortValue || tPort === "ALL";
+                        // Check privacy: if isPrivate is true, it MUST belong to the current user
+                        if (tmpl.isPrivate && tmpl.ownerId !== currentUser?.uid) {
+                          return false;
+                        }
+                        if (selectedListTab === "ONLY_ME") {
+                          return !!tmpl.isPrivate;
+                        } else {
+                          const tPort = (tmpl.port || "").toUpperCase();
+                          return tPort === targetPortValue || tPort === "ALL";
+                        }
                       });
                       const sortedManage = [...filteredManage].sort((a, b) => (a.port || "").localeCompare(b.port || "") || a.name.localeCompare(b.name));
                       
                       return (
                         <div style={{ display: "flex", flexDirection: "column" }}>
+                          {/* Sub-tabs Selection */}
+                          <div style={{ display: "flex", borderBottom: "1px solid #e2e8f0", background: "#e2e8f0" }}>
+                            <button
+                              type="button"
+                              onClick={() => setSelectedListTab("PORT")}
+                              style={{
+                                flex: 1,
+                                padding: "5px 4px",
+                                fontSize: "8.5px",
+                                fontWeight: "900",
+                                background: selectedListTab === "PORT" ? "#ffffff" : "transparent",
+                                color: "#000000",
+                                border: "none",
+                                borderRight: "2px solid #000000",
+                                cursor: "pointer",
+                                textTransform: "uppercase"
+                              }}
+                            >
+                              📍 PORT ({(PORT_CITIES[targetPortValue] || targetPortValue).toUpperCase()})
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSelectedListTab("ONLY_ME")}
+                              style={{
+                                flex: 1,
+                                padding: "5px 4px",
+                                fontSize: "8.5px",
+                                fontWeight: "900",
+                                background: selectedListTab === "ONLY_ME" ? "#ffffff" : "transparent",
+                                color: "#000000",
+                                border: "none",
+                                cursor: "pointer",
+                                textTransform: "uppercase"
+                              }}
+                            >
+                              🔒 ONLY ME ({templates.filter(t => t.isPrivate && t.ownerId === currentUser?.uid).length})
+                            </button>
+                          </div>
+
                           <div style={{ padding: "8px 12px", borderBottom: "1px solid #e2e8f0" }}>
                             <button
                               type="button"
@@ -1657,6 +2304,7 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                                 setTempName("");
                                 setTempText("");
                                 setTempPort(targetPortValue);
+                                setTempIsPrivate(selectedListTab === "ONLY_ME");
                                 setTmplIdToDelete(null);
                               }}
                               style={{
@@ -1696,8 +2344,13 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                                   <div style={{ fontSize: "10.5px", fontWeight: "800", color: "#000000", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "flex", alignItems: "center", gap: 4 }}>
                                     <span>{tmpl.name}</span>
                                     <span style={{ fontSize: "8px", fontWeight: "900", background: "#f1f5f9", color: "#64748b", padding: "1px 3px", borderRadius: "3px" }}>
-                                      {tmpl.port || "ALL"}
+                                      {PORT_CITIES[(tmpl.port || "ALL").toUpperCase()] || tmpl.port}
                                     </span>
+                                    {tmpl.isPrivate && (
+                                      <span style={{ fontSize: "7px", fontWeight: "900", background: "#fef2f2", color: "#ef4444", padding: "1px 3px", borderRadius: "3px", display: "inline-flex", alignItems: "center" }} title={`Private to ${tmpl.ownerUsername || 'you'}`}>
+                                        🔒 ONLY ME
+                                      </span>
+                                    )}
                                   </div>
                                   <div style={{ fontSize: "8.5px", color: "#64748b", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                                     {tmpl.text}
@@ -1713,6 +2366,7 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                                       setTempName(tmpl.name);
                                       setTempText(tmpl.text);
                                       setTempPort(tmpl.port || targetPortValue);
+                                      setTempIsPrivate(!!tmpl.isPrivate);
                                       setTmplIdToDelete(null);
                                     }}
                                     style={{
@@ -1839,7 +2493,7 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                               type="text"
                               value={tempName}
                               onChange={(e) => setTempName(e.target.value)}
-                              placeholder="e.g. 🌡️ Pharma Priority"
+                              placeholder=""
                               style={{
                                 width: "100%",
                                 fontSize: "11px",
@@ -1859,7 +2513,7 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                             <textarea
                               value={tempText}
                               onChange={(e) => setTempText(e.target.value)}
-                              placeholder="ENTER FULL INSTRUCTION DETAILS TO BE COPIED..."
+                              placeholder=""
                               rows={4}
                               style={{
                                 width: "100%",
@@ -1896,7 +2550,7 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                                 }}
                               >
                                 {["ALL", "MEL", "SYD", "BNE", "CNS", "PER", "ADL"].map((st) => (
-                                  <option key={st} value={st}>{st === "ALL" ? "ALL (GLOBAL)" : st}</option>
+                                  <option key={st} value={st}>{PORT_CITIES[st] || st}</option>
                                 ))}
                               </select>
                             </div>
@@ -1914,10 +2568,26 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
                                 borderRadius: "3px",
                                 color: "#64748b"
                               }}>
-                                📌 {tempPort || targetPortValue} (Locked to your Station)
+                                📌 {PORT_CITIES[(tempPort || targetPortValue).toUpperCase()] || (tempPort || targetPortValue)} (Locked to your Station)
                               </div>
                             </div>
                           )}
+
+                          {/* Privacy option checkbox */}
+                          <div style={{ marginTop: "4px", marginBottom: "4px" }}>
+                            <label style={{ fontSize: "9px", fontWeight: "900", color: "#000000", display: "flex", alignItems: "center", gap: "4px", cursor: "pointer", userSelect: "none" }}>
+                              <input
+                                type="checkbox"
+                                checked={tempIsPrivate}
+                                onChange={(e) => setTempIsPrivate(e.target.checked)}
+                                style={{ cursor: "pointer" }}
+                              />
+                              🔒 Private Template (Only Me)
+                            </label>
+                            <span style={{ fontSize: "7.5px", color: "#64748b", display: "block", marginLeft: "14px", marginTop: "1px" }}>
+                              Visible only to: {currentUser?.displayName || currentUser?.email || "you"}
+                            </span>
+                          </div>
 
                           <div style={{ display: "flex", gap: "6px", marginTop: "4px" }}>
                             <button
@@ -1934,14 +2604,15 @@ export const LoadsheetModal: React.FC<LoadsheetModalProps> = ({ row, onClose, cu
 
                                 const targetP = tempPort || targetPortValue;
                                 if (menuMode === "add") {
-                                  handleAddNewTemplate(tempName, tempText, targetP);
+                                  handleAddNewTemplate(tempName, tempText, targetP, tempIsPrivate);
                                 } else if (menuMode === "edit" && editTmplId) {
-                                  handleEditExistingTemplate(editTmplId, tempName, tempText, targetP);
+                                  handleEditExistingTemplate(editTmplId, tempName, tempText, targetP, tempIsPrivate);
                                 }
 
                                 setMenuMode("manage");
                                 setTempName("");
                                 setTempText("");
+                                setTempIsPrivate(false);
                                 setEditTmplId(null);
                               }}
                               style={{

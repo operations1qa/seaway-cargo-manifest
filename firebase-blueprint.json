@@ -90,6 +90,23 @@
         "updatedAt": { "type": "string", "format": "date", "description": "Last saved timestamp" }
       },
       "required": ["id", "name", "text", "port"]
+    },
+    "CtoDetail": {
+      "title": "CtoDetail",
+      "description": "Contact and address information for a Cargo Terminal Operator",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The name of the CTO e.g. MENZIES" },
+        "address": { "type": "string", "description": "Physical address" },
+        "phone": { "type": "string", "description": "Contact phone number" },
+        "email": { "type": "string", "description": "Contact email address" },
+        "notes": { "type": "string", "description": "Any additional operational notes" },
+        "color": { "type": "string", "description": "Highlight color for flight schedule" },
+        "hours": { "type": "string", "description": "Hours of operation" },
+        "ownerId": { "type": "string", "description": "User ID of the customizer" },
+        "updatedAt": { "type": "string", "format": "date", "description": "Last updated timestamp" }
+      },
+      "required": ["name", "ownerId"]
     }
   },
   "firestore": {
@@ -112,6 +129,10 @@
     "cargo_templates/{templateId}": {
       "schema": "CargoTemplate",
       "description": "Pre-defined loading instructions templates per port"
+    },
+    "ctos/{ctoId}": {
+      "schema": "CtoDetail",
+      "description": "Collection of Cargo Terminal Operator directory details"
     }
   }
 }

@@ -35,3 +35,5 @@ export const SEED_DATA: Shipment[] = RAW_SEED.map((s) => ({
   ...s,
   date: julianToDate(s.date),
 })) as unknown as Shipment[];
+
+export const INITIAL_CTOS = {};

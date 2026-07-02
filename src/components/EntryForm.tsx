@@ -4,7 +4,7 @@
  */
 
 import React, { useState } from "react";
-import { Shipment, FlightSchedule } from "../types";
+import { Shipment, FlightSchedule, CtoDirectory } from "../types";
 import { T, INP, SEL } from "../utils/theme";
 import { toDisplay, todayStr, subtractHour, getAvailableCtos, formatAwb } from "../utils/helpers";
 import { Field } from "./UIAtoms";
@@ -15,6 +15,7 @@ interface EntryFormProps {
   onCancel: () => void;
   schedule: FlightSchedule;
   onGoToFlights?: () => void;
+  ctoDirectory?: CtoDirectory;
 }
 
 const BLANK: Omit<Shipment, "id"> = {
@@ -57,8 +58,13 @@ export const EntryForm: React.FC<EntryFormProps> = ({
   onCancel,
   schedule,
   onGoToFlights,
+  ctoDirectory,
 }) => {
-  const DEFAULT_CTOS = ["MENZIES", "SWISSPORT", "QANTAS", "TOLL"];
+  const availableCtos = React.useMemo(() => {
+    if (!ctoDirectory) return [];
+    return Object.keys(ctoDirectory).map(k => k.trim().toUpperCase()).sort();
+  }, [ctoDirectory]);
+
   const dateInputRef = React.useRef<HTMLInputElement | null>(null);
   
   const [form, setForm] = useState<Shipment>(() => {
@@ -69,15 +75,17 @@ export const EntryForm: React.FC<EntryFormProps> = ({
   });
 
   const [isOther, setIsOther] = useState(() => {
+    const defaultCtos = ctoDirectory ? Object.keys(ctoDirectory).map(k => k.trim().toUpperCase()) : [];
     if (initial && initial.cto) {
       const val = initial.cto.trim().toUpperCase();
-      return val && !DEFAULT_CTOS.includes(val);
+      return val && !defaultCtos.includes(val);
     }
     return false;
   });
 
   const [hint, setHint] = useState("");
   const [showMismatchConfirm, setShowMismatchConfirm] = useState(false);
+  const [dateInput, setDateInput] = useState(() => formatTypedDate(initial?.date || todayStr()));
 
   const checkDayMismatch = (flightCode: string, dateStr: string) => {
     if (!flightCode || !dateStr || dateStr.length !== 8) return null;
@@ -136,9 +144,9 @@ export const EntryForm: React.FC<EntryFormProps> = ({
     const val = e.target.value.toUpperCase();
     const sched = schedule[val];
     if (sched) {
-      const co = form.loadType === "LOOSE" ? subtractHour(sched.cutoff) : sched.cutoff;
+      const co = form.loadType === "LOOSE" ? ((sched.looseCutoffExempt && sched.looseCutoffTime) ? sched.looseCutoffTime : subtractHour(sched.cutoff)) : sched.cutoff;
       const schedCto = sched.cto || "";
-      const isCustomCto = schedCto && !DEFAULT_CTOS.includes(schedCto.trim().toUpperCase());
+      const isCustomCto = schedCto && !availableCtos.includes(schedCto.trim().toUpperCase());
       setIsOther(!!isCustomCto);
       setForm((f) => ({
         ...f,
@@ -150,7 +158,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({
         eta: sched.eta || "",
       }));
       setHint(
-        `✓ Cutoff: ${co || "—"} · CTO: ${sched.cto} · Origin: ${sched.origin || "MEL"} · Dest: ${sched.dest || "—"}${form.loadType === "LOOSE" ? " (−1hr LOOSE)" : ""}`
+        `✓ Cutoff: ${co || "—"} · CTO: ${sched.cto} · Origin: ${sched.origin || "MEL"} · Dest: ${sched.dest || "—"}${form.loadType === "LOOSE" ? (sched.looseCutoffExempt ? " (Exempt LOOSE)" : " (−1hr LOOSE)") : ""}`
       );
     } else {
       setForm((f) => ({ ...f, flight: val }));
@@ -162,33 +170,64 @@ export const EntryForm: React.FC<EntryFormProps> = ({
     const lt = e.target.value;
     const sched = schedule[form.flight];
     if (sched) {
-      const co = lt === "LOOSE" ? subtractHour(sched.cutoff) : sched.cutoff;
+      const co = lt === "LOOSE" ? ((sched.looseCutoffExempt && sched.looseCutoffTime) ? sched.looseCutoffTime : subtractHour(sched.cutoff)) : sched.cutoff;
       setForm((f) => ({
         ...f,
         loadType: lt,
         cutoff: co,
       }));
-      setHint(`✓ Cutoff: ${co} ${lt === "LOOSE" ? "(−1hr)" : ""}`);
+      setHint(`✓ Cutoff: ${co} ${lt === "LOOSE" ? (sched.looseCutoffExempt ? "(Exempt)" : "(−1hr)") : ""}`);
     } else {
       setForm((f) => ({ ...f, loadType: lt }));
     }
   };
 
-  const handleDate = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const d = e.target.value.replace(/\D/g, "").slice(0, 8);
-    setForm((f) => ({ ...f, date: d }));
+  const handleDateChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = e.target.value;
+    setDateInput(val);
+    const digits = val.replace(/\D/g, "").slice(0, 8);
+    setForm((f) => ({ ...f, date: digits }));
+  };
+
+  const handleDateBlur = () => {
+    const digits = dateInput.replace(/\D/g, "");
+    if (digits.length === 8) {
+      const formatted = `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4)}`;
+      setDateInput(formatted);
+      setForm((f) => ({ ...f, date: digits }));
+    }
+  };
+
+  const handleCutoffBlur = () => {
+    let raw = form.cutoff.trim();
+    if (!raw) return;
+    const digits = raw.replace(/\D/g, "");
+    if (digits.length === 3) {
+      setForm(f => ({ ...f, cutoff: "0" + digits }));
+    } else if (digits.length === 4) {
+      setForm(f => ({ ...f, cutoff: digits }));
+    }
   };
 
   const submitForm = () => {
-    if (!form.date || form.date.length !== 8) {
+    let rawCutoff = form.cutoff.trim();
+    const digits = rawCutoff.replace(/\D/g, "");
+    if (digits.length === 3) {
+      rawCutoff = "0" + digits;
+    } else if (digits.length === 4) {
+      rawCutoff = digits;
+    }
+    const finalForm = { ...form, cutoff: rawCutoff };
+
+    if (!finalForm.date || finalForm.date.length !== 8) {
       alert("⚠️ Please enter a valid Date in DDMMYYYY format.");
       return;
     }
-    if (!form.awb.trim()) {
+    if (!finalForm.awb.trim()) {
       alert("⚠️ AWB number is required.");
       return;
     }
-    if (!form.flight.trim()) {
+    if (!finalForm.flight.trim()) {
       alert("⚠️ Flight number is required.");
       return;
     }
@@ -196,7 +235,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({
       setShowMismatchConfirm(true);
       return;
     }
-    onSave(form);
+    onSave(finalForm);
   };
 
   return (
@@ -227,8 +266,9 @@ export const EntryForm: React.FC<EntryFormProps> = ({
             <input
               style={{ ...INP, width: "100%", paddingRight: "36px" }}
               placeholder="DD/MM/YYYY"
-              value={formatTypedDate(form.date)}
-              onChange={handleDate}
+              value={dateInput}
+              onChange={handleDateChange}
+              onBlur={handleDateBlur}
               maxLength={10}
             />
             <div style={{ position: "absolute", right: "6px", width: "26px", height: "26px", display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -281,6 +321,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({
                       const mo = parts[1];
                       const dy = parts[2];
                       setForm((f) => ({ ...f, date: `${dy}${mo}${yr}` }));
+                      setDateInput(`${dy}/${mo}/${yr}`);
                     }
                   }
                 }}
@@ -325,7 +366,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({
           )}
         </Field>
         <Field label="Cutoff Time">
-          <input style={INP} value={form.cutoff} onChange={set("cutoff")} />
+          <input style={INP} value={form.cutoff} onChange={set("cutoff")} onBlur={handleCutoffBlur} />
         </Field>
         <Field label="Load Type">
           <select style={SEL} value={form.loadType} onChange={handleLoadType}>
@@ -345,7 +386,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({
         <Field label="CTO">
           <select style={SEL} value={isOther ? "OTHER" : form.cto} onChange={handleCtoSelectChange}>
             <option value="">— select —</option>
-            {getAvailableCtos().map((c) => (
+            {availableCtos.map((c) => (
               <option key={c} value={c}>
                 {c}
               </option>
@@ -382,6 +423,12 @@ export const EntryForm: React.FC<EntryFormProps> = ({
             <option value="NO">NO</option>
             <option value="">BLANK</option>
           </select>
+        </Field>
+        <Field label="Consol Number (Optional)">
+          <input style={INP} value={form.consolRef || ""} onChange={set("consolRef")} placeholder="e.g. C0000XXXX" />
+        </Field>
+        <Field label="Job Number (Optional)">
+          <input style={INP} value={form.jobRef || ""} onChange={set("jobRef")} placeholder="e.g. S0000XXXX" />
         </Field>
 
       </div>

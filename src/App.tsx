@@ -25,16 +25,18 @@ import {
   Globe,
   BookOpen
 } from "lucide-react";
-import { Shipment, FlightSchedule } from "./types";
-import { DEFAULT_SCHEDULE, SEED_DATA } from "./data/mockData";
+import { Shipment, FlightSchedule, CtoDirectory, CtoInfo } from "./types";
+import { DEFAULT_SCHEDULE, SEED_DATA, INITIAL_CTOS } from "./data/mockData";
 import { T } from "./utils/theme";
 import { ShipmentsTab, buildDuplicateSets } from "./components/ShipmentsTab";
 import { EntryForm } from "./components/EntryForm";
 import { FlightAdmin } from "./components/FlightAdmin";
+import { CtoAdmin } from "./components/CtoAdmin";
 import { DateRangeSearch } from "./components/DateRangeSearch";
 import { JobSheetModal } from "./components/JobSheetModal";
 import { LoadsheetModal } from "./components/LoadsheetModal";
 import { CargoTemplatesSettingsAdmin } from "./components/CargoTemplatesSettingsAdmin";
+import { GlobalDataManager } from "./components/GlobalDataManager";
 import { InviteModal } from "./components/InviteModal";
 import { SeawayLogo } from "./components/SeawayLogo";
 import { subtractHour, todayStr, toDisplay } from "./utils/helpers";
@@ -128,11 +130,14 @@ export default function App() {
   const [editingAccount, setEditingAccount] = useState<any | null>(null);
   const [passwordResetTarget, setPasswordResetTarget] = useState<any | null>(null);
   const [newPasswordValue, setNewPasswordValue] = useState("");
+  const [deleteConfirmUser, setDeleteConfirmUser] = useState<any | null>(null);
+  const [deleteSureStep, setDeleteSureStep] = useState(false);
 
   // States synchronized from Cloud Storage
   const [records, setRecords] = useState<Shipment[]>([]);
   const recentlyDeletedIds = useRef<Set<number>>(new Set());
   const [schedule, setSchedule] = useState<FlightSchedule>(DEFAULT_SCHEDULE);
+  const [ctoDirectory, setCtoDirectory] = useState<CtoDirectory>(INITIAL_CTOS);
 
   // Workspace state to allow real-time cross-device collaboration in Company Mode
   const [workspaceId, setWorkspaceId] = useState<string>(() => {
@@ -188,7 +193,7 @@ export default function App() {
   }, [offlineMode]);
 
   const [activeTab, setActiveTab] = useState<"manifest" | "search" | "add" | "flights" | "settings">("manifest");
-  const [settingsSubTab, setSettingsSubTab] = useState<"setup" | "info" | "templates" | "flights">("setup");
+  const [settingsSubTab, setSettingsSubTab] = useState<"setup" | "info" | "templates" | "flights" | "ctos" | "data">("setup");
   const [editingShipment, setEditingShipment] = useState<Shipment | null>(null);
   const [highlightFlight, setHighlightFlight] = useState<string | null>(null);
 
@@ -219,11 +224,19 @@ export default function App() {
   };
 
   const getCombinedProfiles = () => {
-    const combined = [...STATION_PROFILES];
+    let combined = [...STATION_PROFILES];
+    const currentUserEmail = currentUser?.email?.toLowerCase();
+    if (currentUserEmail !== "moeykhalil0@gmail.com") {
+      combined = combined.filter(p => p.email.toLowerCase() !== "moeykhalil0@gmail.com");
+    }
+    
     const defaultEmails = new Set(STATION_PROFILES.map(p => p.email.toLowerCase()));
     
     workUsers.forEach((user, index) => {
       const emailLower = user.email.toLowerCase();
+      if (emailLower === "moeykhalil0@gmail.com" && currentUserEmail !== "moeykhalil0@gmail.com") {
+        return; // Skip Moe for other users
+      }
       if (!defaultEmails.has(emailLower)) {
         const colors = ["#ec4899", "#8b5cf6", "#10b981", "#f97316", "#06b6d4"];
         const color = colors[index % colors.length];
@@ -604,6 +617,38 @@ export default function App() {
       } else {
         setWorkUsers([]);
       }
+
+      // Load ctos
+      const localCtos = localStorage.getItem(`fallback_ctos_${workspaceId || "sandbox"}_${selectedPort}`);
+      if (localCtos) {
+        try {
+          let parsed = JSON.parse(localCtos) as CtoDirectory;
+          const migrationKey = `ctos_notes_cleared_v3_${workspaceId || "sandbox"}_${selectedPort}`;
+          if (localStorage.getItem(migrationKey) !== "true") {
+            localStorage.setItem(migrationKey, "true");
+            const cleared: CtoDirectory = {};
+            for (const [name, info] of Object.entries(parsed)) {
+              const ctoInfo = info as any;
+              cleared[name] = {
+                address: ctoInfo.address || "",
+                phone: ctoInfo.phone || "",
+                email: ctoInfo.email || "",
+                notes: "",
+                color: ctoInfo.color || "",
+                hours: ctoInfo.hours || "",
+              };
+            }
+            parsed = cleared;
+            localStorage.setItem(`fallback_ctos_${workspaceId || "sandbox"}_${selectedPort}`, JSON.stringify(parsed));
+          }
+          setCtoDirectory(parsed);
+        } catch (e) {
+          setCtoDirectory(INITIAL_CTOS);
+        }
+      } else {
+        setCtoDirectory(INITIAL_CTOS);
+        localStorage.setItem(`fallback_ctos_${workspaceId || "sandbox"}_${selectedPort}`, JSON.stringify(INITIAL_CTOS));
+      }
     }
   }, [offlineMode, workspaceId, currentUser, selectedPort]);
 
@@ -693,6 +738,7 @@ export default function App() {
               eta: item.eta || "",
               airline: item.airline || "",
               days: item.days || "",
+              gsa: item.gsa || "",
               emailContacts: item.emailContacts || "",
               contactPhone: item.contactPhone || "",
               bookingPortal: item.bookingPortal || "",
@@ -724,6 +770,88 @@ export default function App() {
         }
       } else {
         setSchedule(selectedPort === "MEL" ? DEFAULT_SCHEDULE : {});
+      }
+    });
+
+    return () => unsubscribe();
+  }, [currentUser, workspaceId, offlineMode, selectedPort]);
+
+  // Monitor real-time CTO directory changes in Firestore
+  useEffect(() => {
+    if (offlineMode) return;
+    if (!currentUser || !workspaceId) {
+      setCtoDirectory(INITIAL_CTOS);
+      return;
+    }
+
+    const ctosRef = collection(db, "ctos");
+    const q = (workspaceId === currentUser.uid)
+      ? query(ctosRef, where("ownerId", "==", currentUser.uid))
+      : query(ctosRef, where("workspaceId", "==", workspaceId));
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const fetched: CtoDirectory = {};
+      let hasNotesToClear = false;
+      snapshot.forEach((doc) => {
+        const item = doc.data();
+        const itemPort = item.port || "MEL";
+        if (item.name && itemPort === selectedPort) {
+          const itemNotes = item.notes || "";
+          if (itemNotes !== "") {
+            hasNotesToClear = true;
+          }
+          fetched[item.name.toUpperCase().trim()] = {
+            address: item.address || "",
+            phone: item.phone || "",
+            email: item.email || "",
+            notes: itemNotes,
+            color: item.color || "",
+            hours: item.hours || "",
+          };
+        }
+      });
+
+      const merged = {
+        ...INITIAL_CTOS,
+        ...fetched,
+      };
+
+      const migrationKey = `ctos_notes_cleared_v3_${workspaceId}_${selectedPort}`;
+      if (hasNotesToClear && localStorage.getItem(migrationKey) !== "true") {
+        localStorage.setItem(migrationKey, "true");
+        // Clear all loaded notes in merged
+        const cleared: CtoDirectory = {};
+        for (const [name, info] of Object.entries(merged)) {
+          const ctoInfo = info as any;
+          cleared[name] = {
+            address: ctoInfo.address || "",
+            phone: ctoInfo.phone || "",
+            email: ctoInfo.email || "",
+            notes: "",
+            color: ctoInfo.color || "",
+            hours: ctoInfo.hours || "",
+          };
+        }
+        // Save the cleared directory to database
+        setTimeout(() => {
+          handleCtoChange(cleared);
+        }, 100);
+        return;
+      }
+
+      setCtoDirectory(merged);
+      localStorage.setItem(`fallback_ctos_${workspaceId}_${selectedPort}`, JSON.stringify(merged));
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, "ctos");
+      const fallbackStr = localStorage.getItem(`fallback_ctos_${workspaceId}_${selectedPort}`);
+      if (fallbackStr) {
+        try {
+          setCtoDirectory(JSON.parse(fallbackStr));
+        } catch (e) {
+          setCtoDirectory(INITIAL_CTOS);
+        }
+      } else {
+        setCtoDirectory(INITIAL_CTOS);
       }
     });
 
@@ -914,13 +1042,26 @@ export default function App() {
       return true; // Default to allow so we don't lock existing users out
     }
     
+    if (tabId === "settings") {
+      return matched.allowedTabs.includes("settings") || 
+             matched.allowedTabs.includes("setup") || 
+             matched.allowedTabs.includes("templates") || 
+             matched.allowedTabs.includes("flights") || 
+             matched.allowedTabs.includes("data");
+    }
+    
     return matched.allowedTabs.includes(tabId);
+  };
+
+  const isSettingsSubTabAllowed = (subTab: "setup" | "info" | "templates" | "flights" | "ctos" | "data") => {
+    if (subTab === "info" || subTab === "ctos") return true; // Always allow viewing user information and CTOs
+    return isTabAllowed(subTab);
   };
 
   // Redirect users if they are currently on a disallowed tab
   useEffect(() => {
     if (currentUser && !isTabAllowed(activeTab)) {
-      const tabs = ["manifest", "search", "add", "flights", "settings"];
+      const tabs = ["manifest", "search", "add", "settings"];
       const firstAllowed = tabs.find(t => isTabAllowed(t));
       if (firstAllowed) {
         setActiveTab(firstAllowed as any);
@@ -928,13 +1069,26 @@ export default function App() {
     }
   }, [currentUser, activeTab, workUsers]);
 
+  // Handle settings sub-tab fallback if current one is not allowed
+  useEffect(() => {
+    if (activeTab === "settings") {
+      const subTabs: ("setup" | "info" | "templates" | "flights" | "ctos" | "data")[] = ["setup", "info", "templates", "flights", "ctos", "data"];
+      if (!isSettingsSubTabAllowed(settingsSubTab)) {
+        const firstAllowed = subTabs.find(t => isSettingsSubTabAllowed(t));
+        if (firstAllowed) {
+          setSettingsSubTab(firstAllowed);
+        }
+      }
+    }
+  }, [activeTab, settingsSubTab, currentUser, workUsers]);
+
   const toggleUserTabAccess = async (userAccount: any, tabId: string) => {
     if (!isUserAdminCurrent()) {
       alert("Unauthorized: Only administrator accounts can modify tab access permissions.");
       return;
     }
 
-    const currentAllowed = userAccount.allowedTabs || ["manifest", "search", "add", "flights", "settings"];
+    const currentAllowed = userAccount.allowedTabs || ["manifest", "search", "add", "setup", "templates", "flights", "data"];
     let newAllowed: string[];
     if (currentAllowed.includes(tabId)) {
       newAllowed = currentAllowed.filter((t: string) => t !== tabId);
@@ -1107,24 +1261,59 @@ export default function App() {
   };
 
   // Helper to remove any work user from the passcode ledger
-  const handleDeleteWorkUser = async (emailKey: string) => {
+  const handleDeleteWorkUser = async (identifier: string) => {
     if (!isUserAdminCurrent()) {
       alert("Unauthorized: Only administrator accounts can delete users.");
       return;
     }
-    const confirmDelete = window.confirm("Are you sure you want to delete this administration account?");
-    if (!confirmDelete) return;
+    if (!identifier) {
+      alert("Error: Cannot delete user without a valid identifier.");
+      return;
+    }
+    // Find matching user robustly by either id, email or computed safe doc id
+    const matchedUser = workUsers.find(u => 
+      u.id === identifier || 
+      u.email?.toLowerCase() === identifier.toLowerCase() || 
+      (u.email && u.email.replace(/[@.]/g, "_") === identifier.replace(/[@.]/g, "_"))
+    );
+
+    if (!matchedUser) {
+      alert("Error: Could not find the specified user in the active ledger.");
+      return;
+    }
+
+    setDeleteConfirmUser(matchedUser);
+    setDeleteSureStep(false);
+  };
+
+  const handleConfirmDeleteWorkUser = async () => {
+    if (!deleteConfirmUser) return;
+    if (!isUserAdminCurrent()) {
+      alert("Unauthorized: Only administrator accounts can delete users.");
+      return;
+    }
+
+    const targetEmail = deleteConfirmUser.email;
+    const safeDocId = targetEmail.replace(/[@.]/g, "_");
+    const displayName = deleteConfirmUser.displayName || deleteConfirmUser.name || targetEmail;
+
     try {
-      const updatedLocalUsers = workUsers.filter(u => u.id !== emailKey);
+      const updatedLocalUsers = workUsers.filter(u => 
+        u.id !== safeDocId && 
+        u.email?.toLowerCase() !== targetEmail.toLowerCase()
+      );
       setWorkUsers(updatedLocalUsers);
       localStorage.setItem("fallback_work_users", JSON.stringify(updatedLocalUsers));
 
       if (!offlineMode) {
-        await deleteDoc(doc(db, "work_users", emailKey));
+        await deleteDoc(doc(db, "work_users", safeDocId));
       }
+      alert(`Success: Account "${displayName}" has been deleted.`);
+      setDeleteConfirmUser(null);
+      setDeleteSureStep(false);
     } catch (err: any) {
       console.error("Delete coworker error:", err);
-      handleFirestoreError(err, OperationType.DELETE, `work_users/${emailKey}`);
+      handleFirestoreError(err, OperationType.DELETE, `work_users/${safeDocId}`);
     }
   };
 
@@ -1215,6 +1404,32 @@ export default function App() {
         const sWorkspaceId = matched.workspaceId || workspaceId;
         const docId = `${sWorkspaceId}_${numericId}`;
         await deleteDoc(doc(db, "shipments", docId));
+      } catch (error) {
+        handleFirestoreError(error, OperationType.DELETE, "shipments");
+      }
+    }
+  };
+
+  const handleMassDeleteShipments = async (ids: number[]) => {
+    if (!currentUser) return;
+    if (ids.length === 0) return;
+    
+    // Optimistic local state update
+    const updatedRecords = records.filter((r) => !ids.includes(Number(r.id)));
+    setRecords(updatedRecords);
+    localStorage.setItem(`fallback_shipments_${workspaceId}`, JSON.stringify(updatedRecords));
+
+    if (!offlineMode) {
+      try {
+        const promises = ids.map(async (numericId) => {
+          const matched = records.find((r) => Number(r.id) === numericId);
+          if (matched) {
+            const sWorkspaceId = matched.workspaceId || workspaceId;
+            const docId = `${sWorkspaceId}_${numericId}`;
+            await deleteDoc(doc(db, "shipments", docId));
+          }
+        });
+        await Promise.all(promises);
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, "shipments");
       }
@@ -1429,6 +1644,7 @@ export default function App() {
             def.eta !== info.eta ||
             def.airline !== info.airline ||
             def.days !== info.days ||
+            def.gsa !== info.gsa ||
             def.emailContacts !== info.emailContacts ||
             def.contactPhone !== info.contactPhone ||
             def.bookingPortal !== info.bookingPortal ||
@@ -1444,6 +1660,7 @@ export default function App() {
               eta: info.eta || "",
               airline: info.airline || "",
               days: info.days || "",
+              gsa: info.gsa || "",
               emailContacts: info.emailContacts || "",
               contactPhone: info.contactPhone || "",
               bookingPortal: info.bookingPortal || "",
@@ -1482,6 +1699,53 @@ export default function App() {
         }
       } catch (error) {
         console.error("Error updating flight mapping inside Firestore: ", error);
+      }
+    }
+  };
+
+  const handleCtoChange = async (updatedCtos: CtoDirectory) => {
+    setCtoDirectory(updatedCtos);
+    localStorage.setItem(`fallback_ctos_${workspaceId || "sandbox"}_${selectedPort}`, JSON.stringify(updatedCtos));
+
+    if (!currentUser) return;
+    if (!offlineMode) {
+      try {
+        const batch = writeBatch(db);
+        let hasOperations = false;
+
+        // Save customized or added CTO entries
+        for (const [name, info] of Object.entries(updatedCtos)) {
+          const docId = `${workspaceId}_${selectedPort}_${name.toUpperCase().trim()}`;
+          batch.set(doc(db, "ctos", docId), {
+            name: name.toUpperCase().trim(),
+            address: info.address || "",
+            phone: info.phone || "",
+            email: info.email || "",
+            notes: info.notes || "",
+            color: info.color || "",
+            hours: info.hours || "",
+            port: selectedPort,
+            ownerId: currentUser.uid,
+            workspaceId: workspaceId,
+            updatedAt: new Date().toISOString(),
+          });
+          hasOperations = true;
+        }
+
+        // Delete removed entries from Firestore if they are no longer in updatedCtos
+        for (const name of Object.keys(ctoDirectory)) {
+          if (!updatedCtos[name]) {
+            const docId = `${workspaceId}_${selectedPort}_${name.toUpperCase().trim()}`;
+            batch.delete(doc(db, "ctos", docId));
+            hasOperations = true;
+          }
+        }
+
+        if (hasOperations) {
+          await batch.commit();
+        }
+      } catch (err: any) {
+        handleFirestoreError(err, OperationType.WRITE, "ctos");
       }
     }
   };
@@ -1597,229 +1861,69 @@ export default function App() {
             </div>
           </div>
 
-          {isResettingPassword ? (
-            <form onSubmit={handlePasswordResetSubmit} style={{ textAlign: "left", display: "flex", flexDirection: "column", gap: "14px" }}>
-              <h3 style={{ fontSize: "15px", fontWeight: 800, color: "#1e293b", margin: "0 0 4px 0", textAlign: "center" }}>Reset Workstation Password</h3>
-              <p style={{ fontSize: "12px", color: "#64748b", margin: "0 0 12px 0", textAlign: "center", lineHeight: "1.4" }}>
-                Verify your registered account details below to set a new workstation password.
-              </p>
+          <form onSubmit={handleLoginSubmit} style={{ textAlign: "left", display: "flex", flexDirection: "column", gap: "16px" }}>
+            <div>
+              <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>User name or Email:</label>
+              <input
+                type="text"
+                placeholder="e.g. melexpair@seaway.com.au or Staff Name"
+                value={loginUsername}
+                onChange={(e) => setLoginUsername(e.target.value)}
+                style={{ width: "100%", padding: "11px 14px", fontSize: "13.5px", border: "1px solid #cbd5e1", borderRadius: "12px", outline: "none", boxSizing: "border-box", color: "#000000" }}
+              />
+            </div>
 
-              <div>
-                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "4px" }}>Registered Email Address:</label>
-                <input
-                  type="email"
-                  placeholder="e.g. employee@seaway.com.au"
-                  value={resetEmail}
-                  onChange={(e) => setResetEmail(e.target.value)}
-                  style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "10px", outline: "none", boxSizing: "border-box" }}
-                />
-              </div>
+            <div>
+              <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>Password:</label>
+              <input
+                type="password"
+                placeholder="Enter Password"
+                value={loginPassword}
+                onChange={(e) => setLoginPassword(e.target.value)}
+                style={{ width: "100%", padding: "11px 14px", fontSize: "13.5px", border: "1px solid #cbd5e1", borderRadius: "12px", outline: "none", boxSizing: "border-box", color: "#000000" }}
+              />
+            </div>
 
-              <div>
-                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "4px" }}>Verification Staff Name:</label>
-                <input
-                  type="text"
-                  placeholder="Exact registered full name"
-                  value={resetName}
-                  onChange={(e) => setResetName(e.target.value)}
-                  style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "10px", outline: "none", boxSizing: "border-box" }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "4px" }}>IATA:</label>
-                <select
-                  value={resetStation}
-                  onChange={(e) => setResetStation(e.target.value)}
-                  style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "10px", outline: "none", boxSizing: "border-box", background: "#ffffff" }}
-                >
-                  {ALL_STATIONS.map((st) => (
-                    <option key={st.value} value={st.value}>{st.label}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "4px" }}>Choose New Password:</label>
-                <input
-                  type="text"
-                  placeholder="Enter secure new password"
-                  value={resetNewPassword}
-                  onChange={(e) => setResetNewPassword(e.target.value)}
-                  style={{ width: "100%", padding: "10px 12px", fontSize: "13px", border: "1px solid #cbd5e1", borderRadius: "10px", outline: "none", boxSizing: "border-box", fontWeight: "bold", color: "#0284c7" }}
-                />
-              </div>
-
-              {resetError && (
-                <div style={{ padding: "10px 12px", background: "#fef2f2", border: "1px solid #fee2e2", borderRadius: "10px", color: "#ef4444", fontSize: "12px", fontWeight: 600 }}>
-                  {resetError}
-                </div>
-              )}
-
-              {resetSuccess && (
-                <div style={{ padding: "10px 12px", background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: "10px", color: "#16a34a", fontSize: "12px", fontWeight: 600 }}>
-                  {resetSuccess}
-                </div>
-              )}
-
-              <div style={{ display: "flex", gap: "10px", marginTop: "6px" }}>
-                <button
-                  type="submit"
-                  disabled={isSubmittingReset}
-                  style={{
-                    flex: 1,
-                    padding: "11px",
-                    background: "#16a34a",
-                    color: "#ffffff",
-                    border: "none",
-                    borderRadius: "10px",
-                    fontSize: "13px",
-                    fontWeight: 700,
-                    cursor: "pointer",
-                    transition: "all 0.15s ease",
-                    opacity: isSubmittingReset ? 0.7 : 1
-                  }}
-                >
-                  {isSubmittingReset ? "Verifying..." : "Reset Password"}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setIsResettingPassword(false);
-                    setPinError("");
-                    setResetError("");
-                    setResetSuccess("");
-                  }}
-                  style={{
-                    background: "#f1f5f9",
-                    border: "1px solid #cbd5e1",
-                    color: "#475569",
-                    padding: "11px 16px",
-                    borderRadius: "10px",
-                    fontSize: "13px",
-                    fontWeight: 700,
-                    cursor: "pointer"
-                  }}
-                >
-                  Back to Login
-                </button>
-              </div>
-            </form>
-          ) : (
-            <form onSubmit={handleLoginSubmit} style={{ textAlign: "left", display: "flex", flexDirection: "column", gap: "16px" }}>
-              <p style={{ fontSize: "13px", color: "#64748b", lineHeight: 1.5, marginBottom: "8px", textAlign: "center" }}>
-                Provide your workstation ID details to access the cargo manifests and load sheets.
-              </p>
-
-              <div>
-                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>User name or Email:</label>
-                <input
-                  type="text"
-                  placeholder="e.g. melexpair@seaway.com.au or Staff Name"
-                  value={loginUsername}
-                  onChange={(e) => setLoginUsername(e.target.value)}
-                  style={{ width: "100%", padding: "11px 14px", fontSize: "13.5px", border: "1px solid #cbd5e1", borderRadius: "12px", outline: "none", boxSizing: "border-box" }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>Password:</label>
-                <input
-                  type="password"
-                  placeholder="Enter Password"
-                  value={loginPassword}
-                  onChange={(e) => setLoginPassword(e.target.value)}
-                  style={{ width: "100%", padding: "11px 14px", fontSize: "13.5px", border: "1px solid #cbd5e1", borderRadius: "12px", outline: "none", boxSizing: "border-box" }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>IATA:</label>
-                <select
-                  value={loginStation}
-                  onChange={(e) => setLoginStation(e.target.value)}
-                  style={{ width: "100%", padding: "11px 14px", fontSize: "13.5px", border: "1px solid #cbd5e1", borderRadius: "12px", outline: "none", boxSizing: "border-box", background: "#ffffff", color: "#1e293b", cursor: "pointer" }}
-                >
-                  {ALL_STATIONS.map((st) => (
-                    <option key={st.value} value={st.value}>{st.label}</option>
-                  ))}
-                </select>
-              </div>
-
-              {pinError && (
-                <div style={{ padding: "10px 12px", background: "#fef2f2", border: "1px solid #fee2e2", borderRadius: "10px", color: "#ef4444", fontSize: "12.5px", fontWeight: 600 }}>
-                  {pinError}
-                </div>
-              )}
-
-              <button
-                type="submit"
-                disabled={submittingAuth}
-                style={{
-                  width: "100%",
-                  padding: "13px",
-                  background: "#0284c7",
-                  color: "#ffffff",
-                  border: "none",
-                  borderRadius: "12px",
-                  fontSize: "14px",
-                  fontWeight: 700,
-                  cursor: "pointer",
-                  transition: "all 0.15s ease",
-                  opacity: submittingAuth ? 0.7 : 1,
-                  marginTop: "6px"
-                }}
+            <div>
+              <label style={{ display: "block", fontSize: "12px", fontWeight: 700, color: "#475569", marginBottom: "6px" }}>IATA:</label>
+              <select
+                value={loginStation}
+                onChange={(e) => setLoginStation(e.target.value)}
+                style={{ width: "100%", padding: "11px 14px", fontSize: "13.5px", border: "1px solid #cbd5e1", borderRadius: "12px", outline: "none", boxSizing: "border-box", background: "#ffffff", color: "#000000", cursor: "pointer" }}
               >
-                {submittingAuth ? "Authorizing access..." : "Sign In to Workstation"}
-              </button>
+                {ALL_STATIONS.map((st) => (
+                  <option key={st.value} value={st.value}>{st.label}</option>
+                ))}
+              </select>
+            </div>
 
-              <div style={{ textAlign: "center", marginTop: "8px" }}>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setIsResettingPassword(true);
-                    setPinError("");
-                    setResetError("");
-                    setResetSuccess("");
-                  }}
-                  style={{ background: "transparent", border: "none", color: "#0284c7", fontSize: "12.5px", fontWeight: 700, cursor: "pointer", textDecoration: "underline" }}
-                >
-                  Forgot Password? Reset password
-                </button>
+            {pinError && (
+              <div style={{ padding: "10px 12px", background: "#fef2f2", border: "1px solid #fee2e2", borderRadius: "10px", color: "#ef4444", fontSize: "12.5px", fontWeight: 600 }}>
+                {pinError}
               </div>
-            </form>
-          )}
+            )}
 
-          {/* Diagnostics Cache and Parameter Eraser */}
-          <div style={{ marginTop: "32px", borderTop: "1px solid #e2e8f0", paddingTop: "14px" }}>
             <button
-              onClick={() => {
-                if (window.confirm("This will log you out, erase your current room memory, clear all browser cache configurations, and restore standard defaults. Correct any sync locks?")) {
-                  localStorage.clear();
-                  if (window.history && window.history.replaceState) {
-                    window.history.replaceState({}, document.title, window.location.pathname);
-                  }
-                  window.location.reload();
-                }
-              }}
+              type="submit"
+              disabled={submittingAuth}
               style={{
-                background: "transparent",
+                width: "100%",
+                padding: "13px",
+                background: "#0284c7",
+                color: "#ffffff",
                 border: "none",
-                color: "#64748b",
-                fontSize: "11px",
-                fontWeight: 600,
+                borderRadius: "12px",
+                fontSize: "14px",
+                fontWeight: 700,
                 cursor: "pointer",
-                textDecoration: "underline",
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "5px"
+                transition: "all 0.15s ease",
+                opacity: submittingAuth ? 0.7 : 1,
+                marginTop: "6px"
               }}
-              onMouseEnter={(e) => e.currentTarget.style.color = "#ef4444"}
-              onMouseLeave={(e) => e.currentTarget.style.color = "#64748b"}
             >
-              🛠️ Registering Issues? Clear Cache & Reset Station
+              {submittingAuth ? "Authorizing access..." : "Sign In to Workstation"}
             </button>
-          </div>
+          </form>
         </div>
       </div>
     );
@@ -1920,7 +2024,7 @@ export default function App() {
                 backgroundPosition: "right 6px center",
                 backgroundSize: "10px",
               }}
-              title={!isUserAdminCurrent() ? `Active Hub (Locked to assigned station: ${selectedPort})` : "Switch Active Operational Port Hub"}
+              title={!isUserAdminCurrent() ? `Active Port (Locked to assigned station: ${selectedPort})` : "Switch Active Operational Port"}
             >
               {ALL_STATIONS.map((st) => (
                 <option key={st.value} value={st.value}>
@@ -2108,6 +2212,7 @@ export default function App() {
                   selectedDate={selectedDate}
                   onSelectedDateChange={setSelectedDate}
                   onGoToFlightSchedule={handleGoToFlightSchedule}
+                  ctoDirectory={ctoDirectory}
                 />
               )}
 
@@ -2118,6 +2223,7 @@ export default function App() {
                     records={portRecords}
                     onEdit={handleEditShipmentClick}
                     onDelete={handleDeleteShipment}
+                    onMassDelete={handleMassDeleteShipments}
                     onLoadsheet={(r) => setActiveLoadsheet(r)}
                     onJobSheet={(r) => setActiveJobSheet(r)}
                     onToggleComplete={handleToggleComplete}
@@ -2126,6 +2232,7 @@ export default function App() {
                     dupDetails={dupDetails}
                     schedule={schedule}
                     onGoToFlightSchedule={handleGoToFlightSchedule}
+                    ctoDirectory={ctoDirectory}
                     open={searchOpen}
                     setOpen={setSearchOpen}
                     from={searchFrom}
@@ -2151,6 +2258,7 @@ export default function App() {
                 <EntryForm
                   initial={editingShipment}
                   schedule={schedule}
+                  ctoDirectory={ctoDirectory}
                   onCancel={() => {
                     setEditingShipment(null);
                     setActiveTab("manifest");
@@ -2182,70 +2290,76 @@ export default function App() {
 
                     {/* Navigation Sub-Tabs for Settings */}
                     <div style={{ display: "flex", gap: "12px", borderBottom: "1px solid #cbd5e1", paddingBottom: "14px", marginBottom: "8px", flexWrap: "wrap" }}>
-                      <button
-                        id="subtab-setup-btn"
-                        onClick={() => setSettingsSubTab("setup")}
-                        style={{
-                          padding: "10px 20px",
-                          borderRadius: "12px",
-                          border: settingsSubTab === "setup" ? "1.5px solid #0284c7" : "1px solid #cbd5e1",
-                          backgroundColor: settingsSubTab === "setup" ? "#f0f9ff" : "#ffffff",
-                          color: settingsSubTab === "setup" ? "#0284c7" : "#475569",
-                          fontWeight: 800,
-                          fontSize: "13px",
-                          cursor: "pointer",
-                          transition: "all 0.15s ease",
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: "6px",
-                          boxShadow: settingsSubTab === "setup" ? "0 4px 6px -1px rgba(2, 132, 199, 0.08)" : "none"
-                        }}
-                      >
-                        ⚙️ Account Setup
-                      </button>
-                      <button
-                        id="subtab-info-btn"
-                        onClick={() => setSettingsSubTab("info")}
-                        style={{
-                          padding: "10px 20px",
-                          borderRadius: "12px",
-                          border: settingsSubTab === "info" ? "1.5px solid #0284c7" : "1px solid #cbd5e1",
-                          backgroundColor: settingsSubTab === "info" ? "#f0f9ff" : "#ffffff",
-                          color: settingsSubTab === "info" ? "#0284c7" : "#475569",
-                          fontWeight: 800,
-                          fontSize: "13px",
-                          cursor: "pointer",
-                          transition: "all 0.15s ease",
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: "6px",
-                          boxShadow: settingsSubTab === "info" ? "0 4px 6px -1px rgba(2, 132, 199, 0.08)" : "none"
-                        }}
-                      >
-                        👥 User Information
-                      </button>
-                      <button
-                        id="subtab-templates-btn"
-                        onClick={() => setSettingsSubTab("templates")}
-                        style={{
-                          padding: "10px 20px",
-                          borderRadius: "12px",
-                          border: settingsSubTab === "templates" ? "1.5px solid #0284c7" : "1px solid #cbd5e1",
-                          backgroundColor: settingsSubTab === "templates" ? "#f0f9ff" : "#ffffff",
-                          color: settingsSubTab === "templates" ? "#0284c7" : "#475569",
-                          fontWeight: 800,
-                          fontSize: "13px",
-                          cursor: "pointer",
-                          transition: "all 0.15s ease",
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: "6px",
-                          boxShadow: settingsSubTab === "templates" ? "0 4px 6px -1px rgba(2, 132, 199, 0.08)" : "none"
-                        }}
-                      >
-                        📊 Cargo Templates
-                      </button>
-                      {isTabAllowed("flights") && (
+                      {isSettingsSubTabAllowed("setup") && (
+                        <button
+                          id="subtab-setup-btn"
+                          onClick={() => setSettingsSubTab("setup")}
+                          style={{
+                            padding: "10px 20px",
+                            borderRadius: "12px",
+                            border: settingsSubTab === "setup" ? "1.5px solid #0284c7" : "1px solid #cbd5e1",
+                            backgroundColor: settingsSubTab === "setup" ? "#f0f9ff" : "#ffffff",
+                            color: settingsSubTab === "setup" ? "#0284c7" : "#475569",
+                            fontWeight: 800,
+                            fontSize: "13px",
+                            cursor: "pointer",
+                            transition: "all 0.15s ease",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "6px",
+                            boxShadow: settingsSubTab === "setup" ? "0 4px 6px -1px rgba(2, 132, 199, 0.08)" : "none"
+                          }}
+                        >
+                          ⚙️ Account Setup
+                        </button>
+                      )}
+                      {isSettingsSubTabAllowed("info") && (
+                        <button
+                          id="subtab-info-btn"
+                          onClick={() => setSettingsSubTab("info")}
+                          style={{
+                            padding: "10px 20px",
+                            borderRadius: "12px",
+                            border: settingsSubTab === "info" ? "1.5px solid #0284c7" : "1px solid #cbd5e1",
+                            backgroundColor: settingsSubTab === "info" ? "#f0f9ff" : "#ffffff",
+                            color: settingsSubTab === "info" ? "#0284c7" : "#475569",
+                            fontWeight: 800,
+                            fontSize: "13px",
+                            cursor: "pointer",
+                            transition: "all 0.15s ease",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "6px",
+                            boxShadow: settingsSubTab === "info" ? "0 4px 6px -1px rgba(2, 132, 199, 0.08)" : "none"
+                          }}
+                        >
+                          👥 User Information
+                        </button>
+                      )}
+                      {isSettingsSubTabAllowed("templates") && (
+                        <button
+                          id="subtab-templates-btn"
+                          onClick={() => setSettingsSubTab("templates")}
+                          style={{
+                            padding: "10px 20px",
+                            borderRadius: "12px",
+                            border: settingsSubTab === "templates" ? "1.5px solid #0284c7" : "1px solid #cbd5e1",
+                            backgroundColor: settingsSubTab === "templates" ? "#f0f9ff" : "#ffffff",
+                            color: settingsSubTab === "templates" ? "#0284c7" : "#475569",
+                            fontWeight: 800,
+                            fontSize: "13px",
+                            cursor: "pointer",
+                            transition: "all 0.15s ease",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "6px",
+                            boxShadow: settingsSubTab === "templates" ? "0 4px 6px -1px rgba(2, 132, 199, 0.08)" : "none"
+                          }}
+                        >
+                          📊 Cargo Templates
+                        </button>
+                      )}
+                      {isSettingsSubTabAllowed("flights") && (
                         <button
                           id="subtab-flights-btn"
                           onClick={() => setSettingsSubTab("flights")}
@@ -2266,6 +2380,52 @@ export default function App() {
                           }}
                         >
                           ✈️ Flight Schedule Admin
+                        </button>
+                      )}
+                      {isSettingsSubTabAllowed("ctos") && (
+                        <button
+                          id="subtab-ctos-btn"
+                          onClick={() => setSettingsSubTab("ctos")}
+                          style={{
+                            padding: "10px 20px",
+                            borderRadius: "12px",
+                            border: settingsSubTab === "ctos" ? "1.5px solid #0284c7" : "1px solid #cbd5e1",
+                            backgroundColor: settingsSubTab === "ctos" ? "#f0f9ff" : "#ffffff",
+                            color: settingsSubTab === "ctos" ? "#0284c7" : "#475569",
+                            fontWeight: 800,
+                            fontSize: "13px",
+                            cursor: "pointer",
+                            transition: "all 0.15s ease",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "6px",
+                            boxShadow: settingsSubTab === "ctos" ? "0 4px 6px -1px rgba(2, 132, 199, 0.08)" : "none"
+                          }}
+                        >
+                          🏢 CTO Directory
+                        </button>
+                      )}
+                      {isSettingsSubTabAllowed("data") && (
+                        <button
+                          id="subtab-data-btn"
+                          onClick={() => setSettingsSubTab("data")}
+                          style={{
+                            padding: "10px 20px",
+                            borderRadius: "12px",
+                            border: settingsSubTab === "data" ? "1.5px solid #0284c7" : "1px solid #cbd5e1",
+                            backgroundColor: settingsSubTab === "data" ? "#f0f9ff" : "#ffffff",
+                            color: settingsSubTab === "data" ? "#0284c7" : "#475569",
+                            fontWeight: 800,
+                            fontSize: "13px",
+                            cursor: "pointer",
+                            transition: "all 0.15s ease",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "6px",
+                            boxShadow: settingsSubTab === "data" ? "0 4px 6px -1px rgba(2, 132, 199, 0.08)" : "none"
+                          }}
+                        >
+                          📦 Global Data Manager
                         </button>
                       )}
                     </div>
@@ -2472,7 +2632,14 @@ export default function App() {
                           <div style={{ display: "flex", flexDirection: "column", gap: "8px", overflowY: "auto", maxHeight: "450px", flex: 1 }} className="custom-scrollbar">
                             {/* Standard Profiles (Built-ins) */}
                             {STATION_PROFILES
-                              .filter(p => isUserAdminCurrent() || p.email.toLowerCase() === currentUser?.email?.toLowerCase())
+                              .filter(p => {
+                                const isMoe = p.email.toLowerCase() === "moeykhalil0@gmail.com";
+                                const isSelf = p.email.toLowerCase() === currentUser?.email?.toLowerCase();
+                                if (isMoe) {
+                                  return isSelf; // Only show Moe's account card to Moe himself
+                                }
+                                return isUserAdminCurrent() || isSelf;
+                              })
                               .map((profile) => {
                                 const showBuiltInPass = currentUser?.email?.toLowerCase() === profile.email.toLowerCase();
                                 const isTargetingThis = passwordResetTarget?.email === profile.email;
@@ -2510,8 +2677,10 @@ export default function App() {
                                         { id: "manifest", name: "Manifest" },
                                         { id: "search", name: "Search" },
                                         { id: "add", name: "New Entry" },
-                                        { id: "flights", name: "Flights" },
-                                        { id: "settings", name: "Settings" }
+                                        { id: "setup", name: "Account Setup" },
+                                        { id: "templates", name: "Cargo Templates" },
+                                        { id: "flights", name: "Flight Schedule" },
+                                        { id: "data", name: "Global Data Manager" }
                                       ].map(tab => (
                                         <span
                                           key={tab.id}
@@ -2607,7 +2776,14 @@ export default function App() {
 
                             {/* Dynamic Work Users */}
                             {workUsers
-                              .filter(u => isUserAdminCurrent() || u.email.toLowerCase() === currentUser?.email?.toLowerCase())
+                              .filter(u => {
+                                const isMoe = u.email.toLowerCase() === "moeykhalil0@gmail.com";
+                                const isSelf = u.email.toLowerCase() === currentUser?.email?.toLowerCase();
+                                if (isMoe) {
+                                  return isSelf; // Only show Moe's account card to Moe himself
+                                }
+                                return isUserAdminCurrent() || isSelf;
+                              })
                               .map((item) => {
                                 const showPassword = !isUserAdminCurrent() || (currentUser?.email?.toLowerCase() === item.email.toLowerCase());
                                 const isOwnCard = currentUser?.email?.toLowerCase() === item.email.toLowerCase();
@@ -2643,8 +2819,10 @@ export default function App() {
                                         { id: "manifest", name: "Manifest" },
                                         { id: "search", name: "Search" },
                                         { id: "add", name: "New Entry" },
-                                        { id: "flights", name: "Flights" },
-                                        { id: "settings", name: "Settings" }
+                                        { id: "setup", name: "Account Setup" },
+                                        { id: "templates", name: "Cargo Templates" },
+                                        { id: "flights", name: "Flight Schedule" },
+                                        { id: "data", name: "Global Data Manager" }
                                       ].map(tab => {
                                         const allowed = !item.allowedTabs || item.allowedTabs.includes(tab.id);
                                         const canManage = isUserAdminCurrent();
@@ -2762,7 +2940,7 @@ export default function App() {
                                                 ✏️ Edit
                                               </button>
                                               <button
-                                                onClick={() => handleDeleteWorkUser(item.id)}
+                                                onClick={() => handleDeleteWorkUser(item.id || item.email)}
                                                 style={{
                                                   background: "#fef2f2",
                                                   color: "#ef4444",
@@ -2787,7 +2965,17 @@ export default function App() {
                                 );
                               })}
                             
-                            {STATION_PROFILES.length === 0 && workUsers.length === 0 && (
+                             {STATION_PROFILES.filter(p => {
+                               const isMoe = p.email.toLowerCase() === "moeykhalil0@gmail.com";
+                               const isSelf = p.email.toLowerCase() === currentUser?.email?.toLowerCase();
+                               if (isMoe) return isSelf;
+                               return isUserAdminCurrent() || isSelf;
+                             }).length === 0 && workUsers.filter(u => {
+                               const isMoe = u.email.toLowerCase() === "moeykhalil0@gmail.com";
+                               const isSelf = u.email.toLowerCase() === currentUser?.email?.toLowerCase();
+                               if (isMoe) return isSelf;
+                               return isUserAdminCurrent() || isSelf;
+                             }).length === 0 && (
                               <div style={{ padding: "20px", textShadow: "none", fontSize: "12.5px", color: "#64748b", textAlign: "center", background: "#f8fafc", borderRadius: "12px", border: "1px dashed #cbd5e1" }}>
                                 No custom operations accounts configured yet. Use the left panel to register team members.
                               </div>
@@ -2816,6 +3004,39 @@ export default function App() {
                             onChange={handleScheduleChange}
                             highlightFlight={highlightFlight}
                             onClearHighlightFlight={() => setHighlightFlight(null)}
+                            ctoDirectory={ctoDirectory}
+                          />
+                        </div>
+                      )}
+
+                      {settingsSubTab === "ctos" && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                          <h3 id="cto-directory-subheading" style={{ fontSize: "14px", fontWeight: 800, color: "#0f172a", margin: "4px 0 2px 2px", paddingBottom: "6px", borderBottom: "2px solid #e2e8f0", textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                            🏢 Cargo Terminal Operators (CTO) Directory — {selectedPort} Only
+                          </h3>
+                          <CtoAdmin
+                            ctoDirectory={ctoDirectory}
+                            onChange={handleCtoChange}
+                            isAdmin={isUserAdminCurrent()}
+                            selectedPort={selectedPort}
+                          />
+                        </div>
+                      )}
+
+                      {settingsSubTab === "data" && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                          <h3 id="global-data-manager-subheading" style={{ fontSize: "14px", fontWeight: 800, color: "#0f172a", margin: "4px 0 2px 2px", paddingBottom: "6px", borderBottom: "2px solid #e2e8f0", textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                            📦 Global Shipment Data & Anomaly Audit Manager — {selectedPort} Only
+                          </h3>
+                          <GlobalDataManager
+                            records={portRecords}
+                            onMassDelete={handleMassDeleteShipments}
+                            onUpdateShipment={handleUpdateShipment}
+                            workspaceId={workspaceId}
+                            onGoToManifestDate={(date) => {
+                              setSelectedDate(date);
+                              setActiveTab("manifest");
+                            }}
                           />
                         </div>
                       )}
@@ -3102,7 +3323,7 @@ export default function App() {
                 </div>
               )}
 
-              {/* Staff Accounts Ledger & Passcodes Manager */}
+               {/* Staff Accounts Ledger & Passcodes Manager */}
               <div style={{ borderTop: "1px solid #f1f5f9", paddingTop: "20px" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
@@ -3112,7 +3333,12 @@ export default function App() {
                     </span>
                   </div>
                   <span style={{ fontSize: "11px", fontWeight: 700, background: "#f1f5f9", color: "#475569", padding: "1px 8px", borderRadius: "10px" }}>
-                    {workUsers.length} Active
+                    {workUsers.filter(u => {
+                      const isMoe = u.email.toLowerCase() === "moeykhalil0@gmail.com";
+                      const isSelf = u.email.toLowerCase() === currentUser?.email?.toLowerCase();
+                      if (isMoe) return isSelf;
+                      return true;
+                    }).length} Active
                   </span>
                 </div>
 
@@ -3121,13 +3347,25 @@ export default function App() {
                 </p>
 
                 {/* List of Registered Coworkers */}
-                {workUsers.length === 0 ? (
+                {workUsers.filter(u => {
+                  const isMoe = u.email.toLowerCase() === "moeykhalil0@gmail.com";
+                  const isSelf = u.email.toLowerCase() === currentUser?.email?.toLowerCase();
+                  if (isMoe) return isSelf;
+                  return true;
+                }).length === 0 ? (
                   <div style={{ border: "1px dashed #cbd5e1", borderRadius: "12px", padding: "16px", textAlign: "center", color: "#64748b", fontSize: "12px", background: "#f8fafc" }}>
                     No corporate team members registered yet. Use the quick form below to add them, or send colleagues the URL to register.
                   </div>
                 ) : (
                   <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "150px", overflowY: "auto", paddingRight: "4px", marginBottom: "16px" }}>
-                    {workUsers.map((item) => (
+                    {workUsers
+                      .filter(u => {
+                        const isMoe = u.email.toLowerCase() === "moeykhalil0@gmail.com";
+                        const isSelf = u.email.toLowerCase() === currentUser?.email?.toLowerCase();
+                        if (isMoe) return isSelf;
+                        return true;
+                      })
+                      .map((item) => (
                       <div
                         key={item.id}
                         style={{
@@ -3177,7 +3415,7 @@ export default function App() {
                             ✉️ Invite
                           </button>
                           <button
-                            onClick={() => handleDeleteWorkUser(item.id)}
+                            onClick={() => handleDeleteWorkUser(item.id || item.email)}
                             style={{
                               background: "transparent",
                               border: "none",
@@ -3271,6 +3509,129 @@ export default function App() {
 
             </div>
 
+          </div>
+        </div>
+      )}
+
+      {/* Delete User Confirmation Modal */}
+      {deleteConfirmUser && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(15, 23, 42, 0.5)",
+            backdropFilter: "blur(4px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1100,
+            fontFamily: "'Inter', sans-serif",
+            padding: "20px",
+          }}
+        >
+          <div
+            style={{
+              background: "#ffffff",
+              width: "100%",
+              maxWidth: "460px",
+              borderRadius: "20px",
+              boxShadow: "0 25px 50px -12px rgba(0, 0, 0, 0.2)",
+              border: "1px solid #e2e8f0",
+              overflow: "hidden",
+              display: "flex",
+              flexDirection: "column",
+            }}
+          >
+            {/* Header */}
+            <div style={{ background: "#ef4444", padding: "20px 24px", color: "#ffffff", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <h3 style={{ fontSize: "16px", fontWeight: 800, margin: 0, letterSpacing: "0.5px", display: "flex", alignItems: "center", gap: "6px" }}>
+                  ⚠️ PERMANENTLY DELETE ACCOUNT
+                </h3>
+              </div>
+              <button 
+                onClick={() => { setDeleteConfirmUser(null); setDeleteSureStep(false); }}
+                style={{ background: "transparent", border: "none", color: "#fee2e2", cursor: "pointer", fontSize: "18px", fontWeight: "bold" }}
+                onMouseEnter={(e) => e.currentTarget.style.color = "#ffffff"}
+                onMouseLeave={(e) => e.currentTarget.style.color = "#fee2e2"}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Content */}
+            <div style={{ padding: "24px", display: "flex", flexDirection: "column", gap: "16px" }}>
+              <div style={{ background: "#fef2f2", border: "1px solid #fee2e2", borderRadius: "12px", padding: "14px", color: "#b91c1c", fontSize: "13px", lineHeight: "1.5" }}>
+                Are you sure you want to delete the administration/coworker account for:
+                <div style={{ fontWeight: 800, fontSize: "14.5px", marginTop: "6px", color: "#991b1b" }}>
+                  {deleteConfirmUser.displayName || deleteConfirmUser.name || deleteConfirmUser.email}
+                </div>
+                <div style={{ fontSize: "11.5px", opacity: 0.85, fontFamily: "monospace" }}>
+                  ✉️ {deleteConfirmUser.email}
+                </div>
+                <div style={{ fontSize: "12px", marginTop: "10px", fontWeight: 700 }}>
+                  This action is permanent and cannot be undone.
+                </div>
+              </div>
+
+              {/* Actions */}
+              <div style={{ display: "flex", gap: "12px", marginTop: "8px" }}>
+                <button
+                  onClick={() => { setDeleteConfirmUser(null); setDeleteSureStep(false); }}
+                  style={{
+                    flex: 1,
+                    padding: "11px",
+                    background: "#f1f5f9",
+                    border: "1px solid #cbd5e1",
+                    borderRadius: "10px",
+                    color: "#475569",
+                    fontWeight: 700,
+                    fontSize: "13px",
+                    cursor: "pointer",
+                  }}
+                >
+                  Cancel
+                </button>
+                {!deleteSureStep ? (
+                  <button
+                    onClick={() => setDeleteSureStep(true)}
+                    style={{
+                      flex: 1,
+                      padding: "11px",
+                      background: "#ef4444",
+                      border: "none",
+                      borderRadius: "10px",
+                      color: "#ffffff",
+                      fontWeight: 700,
+                      fontSize: "13px",
+                      cursor: "pointer",
+                    }}
+                  >
+                    🗑️ Delete Account
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleConfirmDeleteWorkUser}
+                    style={{
+                      flex: 1,
+                      padding: "11px",
+                      background: "#b91c1c",
+                      border: "none",
+                      borderRadius: "10px",
+                      color: "#ffffff",
+                      fontWeight: 800,
+                      fontSize: "13px",
+                      cursor: "pointer",
+                    }}
+                  >
+                    💥 Yes, Confirm Delete!
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
         </div>
       )}

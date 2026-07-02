@@ -12,14 +12,30 @@ export interface FlightInfo {
   eta: string;
   airline?: string;
   days?: string;
+  gsa?: string;
   emailContacts?: string;
   contactPhone?: string;
   bookingPortal?: string;
   bookingNotes?: string;
+  looseCutoffExempt?: boolean;
+  looseCutoffTime?: string;
 }
 
 export interface FlightSchedule {
   [flightCode: string]: FlightInfo;
+}
+
+export interface CtoInfo {
+  address?: string;
+  phone?: string;
+  email?: string;
+  notes?: string;
+  color?: string;
+  hours?: string;
+}
+
+export interface CtoDirectory {
+  [ctoName: string]: CtoInfo;
 }
 
 export interface Shipment {

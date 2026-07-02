@@ -5,7 +5,7 @@
 
 import React, { useState } from "react";
 import { Shipment } from "../types";
-import { getFlightWithDateSuffix, formatAwb } from "../utils/helpers";
+import { getFlightWithDateSuffix, formatAwb, toDisplay } from "../utils/helpers";
 
 interface JobSheetModalProps {
   row: Shipment;
@@ -48,8 +48,8 @@ export const JobSheetModal: React.FC<JobSheetModalProps> = ({ row, onClose }) =>
     .inst-row{display:flex;flex-direction:column;min-height:140px;}
     @media print{
       @page {
-        size: A4 portrait;
-        margin: 10mm 12mm;
+        size: landscape;
+        margin: 8mm 10mm;
       }
       body{padding:0px;margin:0px;}
       .title-box{border-width:4px;}
@@ -68,7 +68,7 @@ export const JobSheetModal: React.FC<JobSheetModalProps> = ({ row, onClose }) =>
           </div>
           <div class="cell cell-br">
             <div class="label-block">1ST FLIGHT / DATE</div>
-            <div class="value-block">${js.firstFlight}</div>
+            <div class="value-block">${js.firstFlight}${row.date ? `<div style="font-size: 11px; font-weight: normal; color: #475569; margin-top: 4px;">(${toDisplay(row.date)})</div>` : ""}</div>
           </div>
           <div class="cell">
             <div class="label-block">2ND FLIGHT</div>

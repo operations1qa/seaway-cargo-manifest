@@ -210,7 +210,7 @@ export const generateJobSheetHtml = (row: any): string => {
           </div>
           <div class="cell cell-br" style="${cellBrSt}">
             <div class="label-block" style="${labelBlockSt}">1ST FLIGHT / DATE</div>
-            <div class="value-block" style="${valueBlockSt}">${firstFlight}</div>
+            <div class="value-block" style="${valueBlockSt}">${firstFlight}${row.date ? `<div style="font-size: 11px; font-weight: normal; color: #475569; margin-top: 4px;">(${toDisplay(row.date)})</div>` : ""}</div>
           </div>
           <div class="cell" style="${cellSt}">
             <div class="label-block" style="${labelBlockSt}">2ND FLIGHT</div>

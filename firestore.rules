@@ -63,5 +63,10 @@ service cloud.firestore {
     match /cargo_templates/{templateId} {
       allow read, write: if true;
     }
+
+    // 9. Cargo Terminal Operator contact details directory
+    match /ctos/{ctoId} {
+      allow read, write: if true;
+    }
   }
 }
