@@ -7,7 +7,7 @@ import React, { useState, useMemo, useRef } from "react";
 import * as XLSX from "xlsx";
 import { Shipment, FlightSchedule, CtoDirectory } from "../types";
 import { T, cCol } from "../utils/theme";
-import { toDisplay, todayStr, generateJobSheetHtml, subtractHour, getDayOfWeek, formatAwb, isUrgentShipment } from "../utils/helpers";
+import { toDisplay, todayStr, generateJobSheetHtml, subtractHour, getDayOfWeek, formatAwb, isUrgentShipment, PORT_TIMEZONES } from "../utils/helpers";
 import { Pill } from "./UIAtoms";
 import { AirlineInfoModal } from "./AirlineInfoModal";
 import { 
@@ -42,6 +42,7 @@ interface ShipmentsTabProps {
   onSelectedDateChange?: (date: string) => void;
   onGoToFlightSchedule?: (flightCode: string) => void;
   ctoDirectory?: CtoDirectory;
+  selectedPort?: string;
 }
 
 // Helper to deduce duplicate actual ULD numbers (e.g. PMC13511QF, AKE92169CX, etc.)
@@ -295,8 +296,9 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
   onSelectedDateChange,
   onGoToFlightSchedule,
   ctoDirectory,
+  selectedPort,
 }) => {
-  const today = todayStr();
+  const today = todayStr(selectedPort);
   const [localDate, setLocalDate] = useState(today);
   const selDate = selectedDate !== undefined ? selectedDate : localDate;
   const setSelDate = onSelectedDateChange !== undefined ? onSelectedDateChange : setLocalDate;
@@ -649,10 +651,25 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
           if (val === undefined || val === null) return "";
           
           if (val instanceof Date) {
-            const d = val.getUTCDate().toString().padStart(2, "0");
-            const m = (val.getUTCMonth() + 1).toString().padStart(2, "0");
-            const y = val.getUTCFullYear().toString();
-            return `${d}${m}${y}`;
+            const tz = PORT_TIMEZONES[(selectedPort || "MEL").toUpperCase()] || "Australia/Melbourne";
+            try {
+              const formatter = new Intl.DateTimeFormat("en-AU", {
+                timeZone: tz,
+                year: "numeric",
+                month: "2-digit",
+                day: "2-digit"
+              });
+              const parts = formatter.formatToParts(val);
+              const d = parts.find(p => p.type === "day")?.value || String(val.getDate()).padStart(2, "0");
+              const m = parts.find(p => p.type === "month")?.value || String(val.getMonth() + 1).padStart(2, "0");
+              const y = parts.find(p => p.type === "year")?.value || String(val.getFullYear());
+              return `${d}${m}${y}`;
+            } catch (e) {
+              const d = val.getDate().toString().padStart(2, "0");
+              const m = (val.getMonth() + 1).toString().padStart(2, "0");
+              const y = val.getFullYear().toString();
+              return `${d}${m}${y}`;
+            }
           }
 
           const num = Number(val);
@@ -724,10 +741,25 @@ export const ShipmentsTab: React.FC<ShipmentsTabProps> = ({
           const parsedTimestamp = Date.parse(str);
           if (!isNaN(parsedTimestamp)) {
             const d = new Date(parsedTimestamp);
-            const day = d.getDate().toString().padStart(2, "0");
-            const month = (d.getMonth() + 1).toString().padStart(2, "0");
-            const year = d.getFullYear().toString();
-            return `${day}${month}${year}`;
+            const tz = PORT_TIMEZONES[(selectedPort || "MEL").toUpperCase()] || "Australia/Melbourne";
+            try {
+              const formatter = new Intl.DateTimeFormat("en-AU", {
+                timeZone: tz,
+                year: "numeric",
+                month: "2-digit",
+                day: "2-digit"
+              });
+              const parts = formatter.formatToParts(d);
+              const day = parts.find(p => p.type === "day")?.value || String(d.getDate()).padStart(2, "0");
+              const month = parts.find(p => p.type === "month")?.value || String(d.getMonth() + 1).padStart(2, "0");
+              const year = parts.find(p => p.type === "year")?.value || String(d.getFullYear());
+              return `${day}${month}${year}`;
+            } catch (e) {
+              const day = d.getDate().toString().padStart(2, "0");
+              const month = (d.getMonth() + 1).toString().padStart(2, "0");
+              const year = d.getFullYear().toString();
+              return `${day}${month}${year}`;
+            }
           }
 
           return pureDigits.slice(0, 8);

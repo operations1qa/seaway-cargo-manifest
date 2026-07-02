@@ -16,6 +16,7 @@ interface EntryFormProps {
   schedule: FlightSchedule;
   onGoToFlights?: () => void;
   ctoDirectory?: CtoDirectory;
+  station?: string;
 }
 
 const BLANK: Omit<Shipment, "id"> = {
@@ -59,6 +60,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({
   schedule,
   onGoToFlights,
   ctoDirectory,
+  station,
 }) => {
   const availableCtos = React.useMemo(() => {
     if (!ctoDirectory) return [];
@@ -71,7 +73,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({
     if (initial) {
       return { ...initial };
     }
-    return { ...BLANK, date: todayStr(), id: 0 } as Shipment;
+    return { ...BLANK, date: todayStr(station), id: 0 } as Shipment;
   });
 
   const [isOther, setIsOther] = useState(() => {
@@ -85,7 +87,7 @@ export const EntryForm: React.FC<EntryFormProps> = ({
 
   const [hint, setHint] = useState("");
   const [showMismatchConfirm, setShowMismatchConfirm] = useState(false);
-  const [dateInput, setDateInput] = useState(() => formatTypedDate(initial?.date || todayStr()));
+  const [dateInput, setDateInput] = useState(() => formatTypedDate(initial?.date || todayStr(station)));
 
   const checkDayMismatch = (flightCode: string, dateStr: string) => {
     if (!flightCode || !dateStr || dateStr.length !== 8) return null;

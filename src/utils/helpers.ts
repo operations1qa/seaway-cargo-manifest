@@ -111,7 +111,84 @@ export const subtractHour = (t: string): string => {
   return newHour + p.slice(2);
 };
 
-export const isUrgentShipment = (row: any): boolean => {
+export const PORT_TIMEZONES: Record<string, string> = {
+  MEL: "Australia/Melbourne",
+  SYD: "Australia/Sydney",
+  BNE: "Australia/Brisbane",
+  CNS: "Australia/Brisbane",
+  PER: "Australia/Perth",
+  ADL: "Australia/Adelaide",
+  ALL: "Australia/Melbourne"
+};
+
+export const getHubOffsetMinutes = (date: Date, port: string): number => {
+  const tz = PORT_TIMEZONES[(port || "MEL").toUpperCase()] || "Australia/Melbourne";
+  try {
+    const tzString = date.toLocaleString("en-US", { timeZone: tz });
+    const localString = date.toLocaleString("en-US", { timeZone: "UTC" });
+    const tzParsed = Date.parse(tzString);
+    const localParsed = Date.parse(localString);
+    return Math.round((tzParsed - localParsed) / 60000);
+  } catch (e) {
+    return 600; // Fallback to +10 hours (AEST)
+  }
+};
+
+export const getHubEpochMs = (
+  year: number,
+  month: number,
+  day: number,
+  hours: number,
+  minutes: number,
+  port: string
+): number => {
+  const utcDate = new Date(Date.UTC(year, month, day, hours, minutes, 0, 0));
+  const offsetMinutes = getHubOffsetMinutes(utcDate, port);
+  return utcDate.getTime() - offsetMinutes * 60000;
+};
+
+export const getRelativeDateStrInTimezone = (offsetDays: number, port?: string): string => {
+  const tz = PORT_TIMEZONES[(port || "MEL").toUpperCase()] || "Australia/Melbourne";
+  const d = new Date();
+  try {
+    const formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "numeric",
+      second: "numeric",
+      hour12: false
+    });
+    const parts = formatter.formatToParts(d);
+    const partMap = Object.fromEntries(parts.map(p => [p.type, p.value]));
+    
+    const tzDate = new Date(
+      parseInt(partMap.year, 10),
+      parseInt(partMap.month, 10) - 1,
+      parseInt(partMap.day, 10),
+      parseInt(partMap.hour, 10),
+      parseInt(partMap.minute, 10)
+    );
+    
+    tzDate.setDate(tzDate.getDate() + offsetDays);
+    
+    const day = String(tzDate.getDate()).padStart(2, "0");
+    const month = String(tzDate.getMonth() + 1).padStart(2, "0");
+    const year = String(tzDate.getFullYear());
+    return `${day}${month}${year}`;
+  } catch (e) {
+    const fallbackDate = new Date();
+    fallbackDate.setDate(fallbackDate.getDate() + offsetDays);
+    const day = String(fallbackDate.getDate()).padStart(2, "0");
+    const month = String(fallbackDate.getMonth() + 1).padStart(2, "0");
+    const year = String(fallbackDate.getFullYear());
+    return `${day}${month}${year}`;
+  }
+};
+
+export const isUrgentShipment = (row: any, port?: string): boolean => {
   if (!row || row.complete) return false;
   if (!row.cutoff || !row.date) return false;
 
@@ -140,22 +217,19 @@ export const isUrgentShipment = (row: any): boolean => {
 
   if (isNaN(day) || isNaN(month) || isNaN(year)) return false;
 
-  const cutoffDate = new Date(year, month, day, hours, minutes, 0, 0);
-  const now = new Date();
+  const activePort = port || row.station || "MEL";
+  const cutoffEpochMs = getHubEpochMs(year, month, day, hours, minutes, activePort);
+  const nowEpochMs = Date.now();
 
-  const diffMs = cutoffDate.getTime() - now.getTime();
+  const diffMs = cutoffEpochMs - nowEpochMs;
   const diffHours = diffMs / (1000 * 60 * 60);
 
   // Highlight red if it's within 2 hours of/before cutoff (including past/overdue)
   return diffHours <= 2;
 };
 
-export const todayStr = (): string => {
-  const d = new Date();
-  const day = String(d.getDate()).padStart(2, "0");
-  const month = String(d.getMonth() + 1).padStart(2, "0");
-  const year = String(d.getFullYear());
-  return `${day}${month}${year}`;
+export const todayStr = (port?: string): string => {
+  return getRelativeDateStrInTimezone(0, port);
 };
 
 export const getFlightWithDateSuffix = (flightCode: string, dateStr: string): string => {

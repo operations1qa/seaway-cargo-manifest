@@ -1019,6 +1019,14 @@ export default function App() {
     }
   }, [currentUser, workUsers]);
 
+  const lastActivePortRef = useRef(selectedPort);
+  useEffect(() => {
+    if (lastActivePortRef.current !== selectedPort) {
+      setSelectedDate(todayStr(selectedPort));
+      lastActivePortRef.current = selectedPort;
+    }
+  }, [selectedPort]);
+
   const isTabAllowed = (tabId: string) => {
     if (!currentUser) return false;
     
@@ -1751,7 +1759,7 @@ export default function App() {
   };
 
   // Selected Date state shared across the app
-  const [selectedDate, setSelectedDate] = useState<string>(todayStr());
+  const [selectedDate, setSelectedDate] = useState<string>(() => todayStr(localStorage.getItem("seaway_active_port") || "MEL"));
 
   // Lifted persistent search states to keep Date Range Search active unless clicked close
   const [searchOpen, setSearchOpen] = useState(true);
@@ -2213,6 +2221,7 @@ export default function App() {
                   onSelectedDateChange={setSelectedDate}
                   onGoToFlightSchedule={handleGoToFlightSchedule}
                   ctoDirectory={ctoDirectory}
+                  selectedPort={selectedPort}
                 />
               )}
 
@@ -2233,6 +2242,7 @@ export default function App() {
                     schedule={schedule}
                     onGoToFlightSchedule={handleGoToFlightSchedule}
                     ctoDirectory={ctoDirectory}
+                    station={selectedPort}
                     open={searchOpen}
                     setOpen={setSearchOpen}
                     from={searchFrom}
@@ -2259,6 +2269,7 @@ export default function App() {
                   initial={editingShipment}
                   schedule={schedule}
                   ctoDirectory={ctoDirectory}
+                  station={selectedPort}
                   onCancel={() => {
                     setEditingShipment(null);
                     setActiveTab("manifest");

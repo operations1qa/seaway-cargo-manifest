@@ -2,7 +2,7 @@ import React, { useState, useMemo, useRef } from "react";
 import * as XLSX from "xlsx";
 import { Shipment, FlightSchedule, CtoDirectory } from "../types";
 import { T, cCol } from "../utils/theme";
-import { toDisplay, generateJobSheetHtml, getDayOfWeek, todayStr, subtractHour, isUrgentShipment } from "../utils/helpers";
+import { toDisplay, generateJobSheetHtml, getDayOfWeek, todayStr, subtractHour, isUrgentShipment, getRelativeDateStrInTimezone } from "../utils/helpers";
 import { Pill } from "./UIAtoms";
 import { 
   Calendar, 
@@ -36,6 +36,7 @@ interface DateRangeSearchProps {
   schedule: FlightSchedule;
   onGoToFlightSchedule?: (flightCode: string) => void;
   ctoDirectory?: CtoDirectory;
+  station?: string;
   
   // Shared state props
   open: boolean;
@@ -91,6 +92,7 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
   schedule,
   onGoToFlightSchedule,
   ctoDirectory,
+  station,
   
   open,
   setOpen,
@@ -1128,27 +1130,23 @@ export const DateRangeSearch: React.FC<DateRangeSearchProps> = ({
               type="button"
               onClick={() => {
                 if (preset.value === "today") {
-                  const tStr = todayStr();
+                  const tStr = todayStr(station);
                   setFrom(tStr);
                   setTo(tStr);
                 } else if (preset.value === "tomorrow") {
-                  const d = new Date();
-                  d.setDate(d.getDate() + 1);
-                  const tomStr = formatDateToDDMMYYYY(d);
+                  const tomStr = getRelativeDateStrInTimezone(1, station);
                   setFrom(tomStr);
                   setTo(tomStr);
                 } else if (preset.value === "next4days") {
-                  const start = new Date();
-                  const end = new Date();
-                  end.setDate(start.getDate() + 3);
-                  setFrom(formatDateToDDMMYYYY(start));
-                  setTo(formatDateToDDMMYYYY(end));
+                  const startStr = getRelativeDateStrInTimezone(0, station);
+                  const endStr = getRelativeDateStrInTimezone(3, station);
+                  setFrom(startStr);
+                  setTo(endStr);
                 } else if (preset.value === "next30days") {
-                  const start = new Date();
-                  const end = new Date();
-                  end.setDate(start.getDate() + 29);
-                  setFrom(formatDateToDDMMYYYY(start));
-                  setTo(formatDateToDDMMYYYY(end));
+                  const startStr = getRelativeDateStrInTimezone(0, station);
+                  const endStr = getRelativeDateStrInTimezone(29, station);
+                  setFrom(startStr);
+                  setTo(endStr);
                 } else if (preset.value === "clear") {
                   setFrom("");
                   setTo("");
